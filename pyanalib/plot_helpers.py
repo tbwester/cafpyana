@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 
+import numpy as np
+import pandas as pd
+
+import cafpyana.pyanalib.pandas_helpers as ph
+
+
+_INDEX_COLS = [("__ntuple", "", "", "", "", ""), ("entry", "", "", "", "", "")] 
 _LEVELS_RECO = ['__ntuple', 'entry', 'rec.slc..index']
+_LEVELS_MC = ['__ntuple', 'entry', 'rec.mc.nu..index']
 
 
 def df_index_size(df: pd.DataFrame, levels: list[int | str] | None=None) -> int:
@@ -58,6 +66,97 @@ def recodf_tmatch(recodf: pd.DataFrame) -> pd.DataFrame:
             )
 
     return recodf_best_tmatch, recodf_bad_tmatch, recodf_no_tmatch
+
+
+def slice_purity(mcdf: pd.DataFrame, recodf: pd.DataFrame, true_type_col):
+    """
+    Compute the purity (true interaction content per slice) for a recodf + mcdf
+    true_type_col: mcdf column containing true type labels
+    """
+
+    # get all slices & true interactions
+    # drop duplicates to correctly count slices even if user has merged in other dfs (track, pfp, etc.)
+    true_type_df = mcdf[[true_type_col]].groupby(level=[0, 1, 2]).first()
+    slice_df = recodf[[("slc", "tmatch", "idx", "", "", "")]].groupby(level=[0, 1, 2]).first()
+
+    # keep all slices, match to true interactions
+    matchdf = ph.multicol_merge(slice_df.reset_index(), true_type_df.reset_index(),
+                                left_on=_INDEX_COLS + [("slc", "tmatch", "idx", "", "", "")],
+                                right_on=_INDEX_COLS + [("rec.mc.nu..index", "", "", "", "", "")],
+                                how="left").set_index(_LEVELS_RECO).sort_index()
+    
+    # count all slices
+    ntotal = df_index_size(matchdf, _LEVELS_RECO)
+    result = {'total': ntotal}
+
+    assert ntotal == df_index_size(recodf, _LEVELS_RECO)
+
+    matchdf.loc[pd.isna(matchdf.true_type), true_type_col] = np.nan
+
+    true_type_counts = (matchdf
+        .reset_index()
+        .drop_duplicates(_INDEX_COLS + [('rec.slc..index', '', '', '', '', '')])
+        .groupby(true_type_col, dropna=False)
+        .size()
+    )
+
+    for tt in matchdf[true_type_col].unique():
+        try:
+            result[tt] = true_type_counts.loc[tt]
+        except KeyError:
+            pass
+
+    return result
+
+
+def slice_efficiency(mcdf: pd.DataFrame, recodf: pd.DataFrame, true_type_col):
+    """
+    Compute the efficiency (slices / true interactions) for a recodf.
+    True interactions are from a colum in MCdf
+    """
+
+    # get all slices & true interactions
+    # drop duplicates to correctly count slices even if user has merged in other dfs (track, pfp, etc.)
+    slice_df = recodf[[("slc", "tmatch", "idx", "", "", "")]].groupby(level=[0, 1, 2]).first()
+    true_type_df = mcdf[[true_type_col]].groupby(level=[0, 1, 2]).first()
+
+    # dict mapping types to counts
+    true_type_counts = (true_type_df
+        .groupby(true_type_col, dropna=False)
+        .size()
+    )
+
+    matchdf = ph.multicol_merge(true_type_df.reset_index(), slice_df.reset_index(),
+                                left_on=_INDEX_COLS + [("rec.mc.nu..index", "", "", "", "", "")],
+                                right_on=_INDEX_COLS + [("slc", "tmatch", "idx", "", "", "")],
+                                how="left").set_index(_LEVELS_MC).sort_index()
+
+    result = {}
+
+    # regularize NaNs to numpy nan in case there are pandas NAs too
+    matchdf.loc[pd.isna(matchdf[true_type_col]), true_type_col] = np.nan
+    matchdf['valid_reco'] = ~pd.isna(matchdf.slc.tmatch.idx)
+    print(matchdf)
+    print(matchdf.columns)
+
+    true_type_pass = (matchdf
+        .reset_index()
+        .drop_duplicates(_INDEX_COLS + [('rec.mc.nu..index', '', '', '', '', '')])
+        .groupby([true_type_col, 'valid_reco'], dropna=False)
+        .size()
+    )
+
+    print(true_type_pass)
+
+    for tt in matchdf[true_type_col].unique():
+        ntotal = true_type_counts.loc[tt]
+        try:
+            npass = true_type_pass.loc[(tt, True)]
+        except KeyError:
+            npass = 0
+        result[tt] = {'pass': npass, 'total': ntotal}
+
+    return result
 
 
 def run_subrun_event(hdrdf: pd.DataFrame, df: pd.DataFrame):
