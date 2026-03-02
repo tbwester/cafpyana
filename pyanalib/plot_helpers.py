@@ -131,13 +131,13 @@ def slice_efficiency(mcdf: pd.DataFrame, recodf: pd.DataFrame, true_type_col):
                                 right_on=_INDEX_COLS + [("slc", "tmatch", "idx", "", "", "")],
                                 how="left").set_index(_LEVELS_MC).sort_index()
 
+
+    assert df_index_size(matchdf, _LEVELS_MC) == df_index_size(mcdf, _LEVELS_MC)
     result = {}
 
     # regularize NaNs to numpy nan in case there are pandas NAs too
     matchdf.loc[pd.isna(matchdf[true_type_col]), true_type_col] = np.nan
     matchdf['valid_reco'] = ~pd.isna(matchdf.slc.tmatch.idx)
-    print(matchdf)
-    print(matchdf.columns)
 
     true_type_pass = (matchdf
         .reset_index()
@@ -146,15 +146,14 @@ def slice_efficiency(mcdf: pd.DataFrame, recodf: pd.DataFrame, true_type_col):
         .size()
     )
 
-    print(true_type_pass)
-
     for tt in matchdf[true_type_col].unique():
         ntotal = true_type_counts.loc[tt]
         try:
             npass = true_type_pass.loc[(tt, True)]
         except KeyError:
             npass = 0
-        result[tt] = {'pass': npass, 'total': ntotal}
+        result[(tt, 'pass')] = npass
+        result[(tt, 'total')] = ntotal
 
     return result
 
@@ -166,39 +165,26 @@ def run_subrun_event(hdrdf: pd.DataFrame, df: pd.DataFrame):
     ]).unique(), ['run', 'subrun', 'evt']].sort_index()
 
 
-class CafpyanaHist:
+class CafpyanaAccumulator:
     """
-    Class to keep running total histogram from multiple df splits.
-    If mode is not 'binned', values are added to a list for binning later.
+    Class to keep running totals from multiple splits.
     """
-    def __init__(self, histfunc, mode='binned', bins=None, norm: float=1.0):
-        self._bins = bins
-        self._func = histfunc
-        self._norm = norm
+    def __init__(self, func, mode='add', norm: float=1.0):
+        self._func = func
 
-        self._binned_mode = (mode == 'binned')
+        self._add_mode = (mode == 'add')
         self._is_dict = False
         self._counts = None
-
-    @property
-    def norm(self) -> float:
-        return self._norm
-
-    @norm.setter
-    def norm(self, val: float) -> None:
-        self._norm = val
+        self._norm = norm
 
     def add(self, *args):
         """
-        Add call _func with args and add to total hist.
+        Add call _func with args and add to counts
         If we are appending the result to a list, then assume there is no binning yet
         """
-        if self._binned_mode:
-            # func should return bins and counts
-            bins, counts = self._func(*args, bins=self._bins)
-        else:
-            # func only needs to return "counts" (values)
-            counts = self._func(*args)
+
+        # counts can be numpy array or single float, or dict of either
+        counts = self._func(*args)
 
         # no counts yet, just set
         if self._counts is None:
@@ -208,7 +194,7 @@ class CafpyanaHist:
 
         # simple histograms without multiple series
         if not self._is_dict:
-            if self._binned_mode:
+            if self._add_mode:
                 self._counts += counts
             else:
                 self._counts = np.concatenate([self._counts, counts])
@@ -218,7 +204,7 @@ class CafpyanaHist:
         for k, v in counts.items():
             try:
                 # if we are not appending, counts are added element-wise per numpy
-                if self._binned_mode:
+                if self._add_mode:
                     self._counts[k] += v
                 else:
                     self._counts[k] = np.concatenate([self._counts[k], v])
@@ -232,8 +218,8 @@ class CafpyanaHist:
             # sort by key before returning
             result = {
                 k: self._counts[k] * self._norm for k in sorted(self._counts.keys(),
-                    key=lambda x: float('inf') if pd.isna(x) else x)
+                    key=lambda x: float('inf') if (pd.isna(x) or isinstance(x, str)) else x)
             }
         else:
             result = self._norm * self._counts
-        return self._bins, result
+        return result
