@@ -199,7 +199,9 @@ def make_kaon_recodf(f: pd.DataFrame, save_track_truth: bool=False) -> pd.DataFr
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_kaon',
-        'rec.slc.reco.pfp.trk.bestplane'
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_muon',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_muon',
+        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_muon',
     ]).rec.slc.reco
     pandora_df = ph.multicol_merge(pandora_df, kpid, left_index=True, right_index=True, how='left')
 
