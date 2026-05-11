@@ -152,6 +152,9 @@ def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFr
 
     mcdf = mcdf.loc[:, mask]
 
+    # drop daughters after selection
+    # mcdf = mcdf.xs(-1, level=3, drop_level=False)
+
     return mcdf
 
 
@@ -194,16 +197,26 @@ def make_kaon_recodf(f: pd.DataFrame, save_track_truth: bool=False) -> pd.DataFr
 
     pandora_df = ph.multicol_merge(pandora_df, daughter_id, left_index=True, right_index=True, how='left')
 
-    # kaon pid score
+    # kaon and other pid scores not saved by default
     kpid = ph.loadbranches(f["recTree"], [
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_muon',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_muon',
-        # 'rec.slc.reco.pfp.trk.chi2pid.2.chi2_muon',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_proton',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_proton',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_pion',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_pion',
+        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_pion',
     ]).rec.slc.reco
     pandora_df = ph.multicol_merge(pandora_df, kpid, left_index=True, right_index=True, how='left')
+
+    # kaon momentum estimators
+    kmom = ph.loadbranches(f["recTree"], [
+        'rec.slc.reco.pfp.trk.mcsP.fwdP_kaon',
+    ]).rec.slc.reco
+    pandora_df = ph.multicol_merge(pandora_df, kmom, left_index=True, right_index=True, how='left')
 
     # barycenter flash match
     bcfm_df = ph.loadbranches(f["recTree"], branches.barycenterFMbranches)
