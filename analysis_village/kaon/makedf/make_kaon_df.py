@@ -35,14 +35,15 @@ InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
 InAV_SBND = functools.partial(util.InAV, det='SBND')
 
 
-def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.MultiIndex:
+def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.Series:
     """
     Signal identification using backward hierarchy traversal.
-    Starts from daughters (mu+, pi+) and traces parentage up to a primary Kaon.
-    Handles arbitrary scattering depths (K+ -> K+ -> K+ ... -> mu+).
+    Returns a Series mapping (entry, interaction_id) -> daughter_pdg.
+    Handles arbitrary scattering depths and preserves the MIP type.
     """
+    nulldf = pd.Series(dtype=float, name='k_daughter_pdg')
     if tpartdf.empty:
-        return pd.MultiIndex(levels=[[], []], codes=[[], []], names=[tpartdf.index.names[0], 'interaction_id'])
+        return nulldf
 
     # 1. Simplify tpartdf for traversal
     df = tpartdf.copy()
@@ -53,23 +54,24 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     target_pdgs = [-13, 211] if ktype == 'kplus' else []
     # We track the "active" particles being traced upwards
     active = df[df.pdg.isin(target_pdgs)].copy()
+    active['daughter_pdg'] = active['pdg']
     
     if active.empty:
-        return pd.MultiIndex(levels=[[], []], codes=[[], []], names=[tpartdf.index.names[0], 'interaction_id'])
+        return nulldf
 
 
     # Initial daughter-level containment
     if require_contained:
-        active = active[active.cont_tpc == 1]
         # MIP must also stop in active volume
+        dtr_start = active[['start.x', 'start.y', 'start.z']].rename(columns=lambda x: x.split('.')[-1])
         dtr_end = active[['end.x', 'end.y', 'end.z']].rename(columns=lambda x: x.split('.')[-1])
-        active = active[InAV_SBND(dtr_end)]
+        active = active[InAV_SBND(dtr_start) & InAV_SBND(dtr_end)]
     
     if active.empty:
-        return pd.MultiIndex(levels=[[], []], codes=[[], []], names=[tpartdf.index.names[0], 'interaction_id'])
+        return nulldf
 
     # This will store success (entry, interaction_id)
-    signal_interactions = []
+    signal_results = []
     k_pdg = KPDG[ktype]
 
     # 3. Trace backwards generation by generation
@@ -101,7 +103,7 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
             
         successes = parents[is_primary_k]
         if not successes.empty:
-            signal_interactions.append(successes[['entry', 'interaction_id']])
+            signal_results.append(successes[['entry', 'interaction_id', 'daughter_pdg']])
         
         # Continue tracing for those whose parent is a Kaon but not yet primary
         active = parents[is_k_parent & ~is_primary_k].copy()
@@ -110,26 +112,33 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
             active['G4ID'] = active['G4ID_p']
             active['parent'] = active['parent_p']
             active['cont_tpc'] = active['cont_tpc_p']
-            active = active[['entry', 'G4ID', 'parent', 'cont_tpc', 'interaction_id']]
+            active = active[['entry', 'G4ID', 'parent', 'cont_tpc', 'interaction_id', 'daughter_pdg']]
             if require_contained:
                 active = active[active.cont_tpc == 1]
 
-    if not signal_interactions:
-        return pd.MultiIndex(levels=[[], []], codes=[[], []], names=[tpartdf.index.names[0], 'interaction_id'])
+    if not signal_results:
+        return nulldf
 
-    # 4. Consolidate results
-    res_df = pd.concat(signal_interactions).drop_duplicates()
-    return pd.MultiIndex.from_frame(res_df)
+    # 4. Consolidate results. If one interaction has multiple signal chains
+    # with DIFFERENT daughter PDGs, we treat it as ambiguous (NaN).
+    res_df = pd.concat(signal_results).drop_duplicates()
+
+    # Enforce one golden daughter type per interaction
+    counts = res_df.groupby(['entry', 'interaction_id']).daughter_pdg.nunique()
+    unambiguous = counts[counts == 1].index
+    
+    final_pdgs = res_df.set_index(['entry', 'interaction_id']).loc[unambiguous]
+    return final_pdgs.groupby(level=[0, 1]).first().daughter_pdg
 
 
-def signal(mcdf: pd.DataFrame, signal_idx: pd.MultiIndex, cc: bool=True) -> pd.Series:
+def signal(mcdf: pd.DataFrame, cc: bool=True) -> pd.Series:
     """
     Signal definition for mcdf.
     Uses pre-computed hierarchy-traced signal indices.
     """
+    has_golden = ~mcdf.k_daughter_pdg.isna()
     cc_nc = (mcdf.iscc == cc)
-    # Match the interaction-level index (entry, nu_idx)
-    return mcdf.index.droplevel(list(range(2, mcdf.index.nlevels))).isin(signal_idx) & mcdf.is_true_fv & cc_nc
+    return has_golden & mcdf.is_true_fv & cc_nc
 
 
 def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFrame:
@@ -154,9 +163,9 @@ def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFr
     tpartdf = ph.loadbranches(f["recTree"], branches.trueparticlebranches).rec.true_particles
     tpartdf = tpartdf.reset_index().set_index(['entry', 'G4ID'])
 
-    # Compute signal indices using hierarchy traversal
-    kp_signal_idx = k_has_daughter(tpartdf, 'kplus', require_contained=True)
-    kp_signal_idx_nocont = k_has_daughter(tpartdf, 'kplus', require_contained=False)
+    # Compute signal daughter PDGs using hierarchy traversal
+    kp_signal_pdgs = k_has_daughter(tpartdf, 'kplus', require_contained=True)
+    kp_signal_pdgs_nocont = k_has_daughter(tpartdf, 'kplus', require_contained=False)
 
     mcprimdaughtersdf = makedf.make_mcprimdaughtersdf(f).rec.mc.nu.prim
     daughterdf = mcprimdaughtersdf[mcprimdaughtersdf.index.droplevel(-1).isin(mcprimdf.index)]
@@ -181,14 +190,18 @@ def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFr
     # finally, merge primaries into mc
     mcdf = ph.multicol_merge(mcdf, mcprimdf, how="left", left_index=True, right_index=True, validate="one_to_one")
 
+    # Map the interaction-level daughter PDG to the particle-level mcdf
+    nu_level_idx = mcdf.index.droplevel(list(range(2, mcdf.index.nlevels)))
+    mcdf['k_daughter_pdg'] = nu_level_idx.map(kp_signal_pdgs)
+
     mcdf['is_true_fv'] = InFV_SBND(mcdf.position)
-    mcdf['is_signal_kp_cc'] = signal(mcdf, kp_signal_idx, cc=True)
-    mcdf['is_signal_kp_nc'] = signal(mcdf, kp_signal_idx, cc=False)
+    mcdf['is_signal_kp_cc'] = signal(mcdf, cc=True)
+    mcdf['is_signal_kp_nc'] = signal(mcdf, cc=False)
 
     # extra columns for truth studies
     if signal_cut_columns:
-        mcdf['has_daughter'] = mcdf.index.droplevel(list(range(2, mcdf.index.nlevels))).isin(kp_signal_idx_nocont)
-        mcdf['has_daughter_cont'] = mcdf.index.droplevel(list(range(2, mcdf.index.nlevels))).isin(kp_signal_idx)
+        mcdf['has_daughter'] = ~nu_level_idx.map(kp_signal_pdgs_nocont).isna()
+        mcdf['has_daughter_cont'] = ~nu_level_idx.map(kp_signal_pdgs).isna()
 
     # drop things we don't need
     mask = (
@@ -206,7 +219,6 @@ def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFr
     )
 
     mcdf = mcdf.loc[:, mask]
-
 
     # drop daughters after selection
     # mcdf = mcdf.xs(-1, level=3, drop_level=False)
