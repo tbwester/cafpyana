@@ -50,6 +50,11 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     df.columns = ['.'.join(n for n in c if n != '') for c in df.columns]
     df = df.reset_index()
 
+    # Pre-compute daughter counts for each parent particle
+    dtr_counts = df.groupby(['entry', 'parent']).size().rename('ndaughters')
+    df = df.merge(dtr_counts, left_on=['entry', 'G4ID'], right_index=True, how='left')
+    df['ndaughters'] = df['ndaughters'].fillna(0)
+
     # 2. Identify potential signal daughters (mu+, pi+)
     target_pdgs = [-13, 211] if ktype == 'kplus' else []
     # We track the "active" particles being traced upwards
@@ -73,16 +78,18 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     # This will store success (entry, interaction_id)
     signal_results = []
     k_pdg = KPDG[ktype]
+    is_first_step = True
 
     # 3. Trace backwards generation by generation
     while not active.empty:
         # Get parents of active particles
         parents = active.merge(
-            df[['entry', 'G4ID', 'pdg', 'parent', 'cont_tpc']].rename(columns={
+            df[['entry', 'G4ID', 'pdg', 'parent', 'cont_tpc', 'ndaughters']].rename(columns={
                 'G4ID': 'G4ID_p',
                 'pdg': 'pdg_p',
                 'parent': 'parent_p',
-                'cont_tpc': 'cont_tpc_p'
+                'cont_tpc': 'cont_tpc_p',
+                'ndaughters': 'ndaughters_p'
             }),
             left_on=['entry', 'parent'],
             right_on=['entry', 'G4ID_p']
@@ -93,6 +100,11 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
 
         # Is the parent a Kaon?
         is_k_parent = (parents.pdg_p == k_pdg)
+
+        # Enforce two-body decay (<= 2 daughters) for the immediate decaying parent
+        if is_first_step:
+            is_k_parent &= (parents.ndaughters_p <= 2)
+            is_first_step = False
         
         # If Kaon parent and it is primary (parent 10000000), we found a signal chain!
         is_primary_k = is_k_parent & (parents.parent_p == 10000000)
@@ -222,6 +234,7 @@ def make_kaon_mcdf(f: pd.DataFrame, signal_cut_columns: bool=False) -> pd.DataFr
 
     # drop daughters after selection
     # mcdf = mcdf.xs(-1, level=3, drop_level=False)
+    # print(mcdf.loc[mcdf['is_signal_kp_cc'], 'k_daughter_pdg'])
 
     return mcdf
 
