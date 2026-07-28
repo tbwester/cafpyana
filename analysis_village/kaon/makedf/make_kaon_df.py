@@ -1,12 +1,12 @@
 import functools
 
-import cafpyana.makedf.getsyst as getsyst
-import cafpyana.makedf.util as util
-import cafpyana.pyanalib.pandas_helpers as ph
+import makedf.getsyst as getsyst
+import makedf.util as util
+import pyanalib.pandas_helpers as ph
 import numpy as np
 import pandas as pd
-from cafpyana.makedf import chi2pid
-from cafpyana.makedf.makedf import make_mchdrdf, make_trkhitdf
+from makedf import chi2pid
+from makedf.makedf import make_mchdrdf, make_trkhitdf
 
 KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
