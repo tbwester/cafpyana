@@ -68,13 +68,18 @@ def chi2u(hitdf, dedxname="dedx"):
 def chi2p(hitdf, dedxname="dedx"):
     return chi2(hitdf, proton_rr, proton_dedx, proton_yerr, dedxname)
 
+def chi2k(hitdf, dedxname="dedx"):
+    return chi2(hitdf, kaon_rr, kaon_dedx, kaon_yerr, dedxname)
+
 def chi2par(hitdf, dedxname="dedx", par=""):
     if par == "muon":
         return chi2u(hitdf, dedxname)
     elif par == "proton":
         return chi2p(hitdf, dedxname)
+    elif par == "kaon":
+        return chi2k(hitdf, dedxname)
     else:
-        raise ValueError(f"Invalid par={par!r}. Expected 'muon' or 'proton'.")
+        raise ValueError(f"Invalid par={par!r}. Expected 'muon', 'proton', or 'kaon'.")
 
 def chi2_ndof(hitdf):
     when_chi2 = (hitdf.rr < rr_max_cut_chi2) & ~hitdf.firsthit & ~hitdf.lasthit & (hitdf.dedx < 1000.)
@@ -260,6 +265,7 @@ fhist = datadir + "dEdxrestemplates.root"
 
 profp = uproot.open(fhist)["dedx_range_pro"]
 profmu = uproot.open(fhist)["dedx_range_mu"]
+profka = uproot.open(fhist)["dedx_range_ka"]
 
 proton_dedx = profp.values()
 proton_rr = profp.axis().edges()
@@ -269,6 +275,15 @@ for i in range(len(proton_yerr)):
         proton_yerr[i] = (proton_yerr[i-1] + proton_yerr[i+1]) / 2
     if proton_dedx[i] < 1e-6:
         proton_dedx[i] = (proton_dedx[i-1] + proton_dedx[i+1]) / 2
+
+kaon_dedx = profka.values()
+kaon_rr = profka.axis().edges()
+kaon_yerr = profka.errors(error_mode="s")
+for i in range(len(kaon_yerr)):
+    if kaon_yerr[i] < 1e-6:
+        kaon_yerr[i] = (kaon_yerr[i-1] + kaon_yerr[i+1]) / 2
+    if kaon_dedx[i] < 1e-6:
+        kaon_dedx[i] = (kaon_dedx[i-1] + kaon_dedx[i+1]) / 2
 
 muon_dedx = profmu.values()
 muon_rr = profmu.axis().edges()

@@ -5,6 +5,8 @@ import cafpyana.makedf.util as util
 import cafpyana.pyanalib.pandas_helpers as ph
 import numpy as np
 import pandas as pd
+from cafpyana.makedf import chi2pid
+from cafpyana.makedf.makedf import make_mchdrdf, make_trkhitdf
 
 KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
@@ -220,6 +222,9 @@ def make_slice_df(f: dict) -> pd.DataFrame:
     if isinstance(slc_df.columns, pd.MultiIndex):
         slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
 
+    # PRE-CUT: Only keep slices that are not clear cosmics
+    slc_df = slc_df[slc_df.is_clear_cosmic == 0]
+
     return slc_df
 
 def make_syst_df(f: dict) -> pd.DataFrame:
@@ -279,8 +284,14 @@ def _extract_base_track_df(f: dict):
         'rec.slc.reco.pfp.trk.end.x',
         'rec.slc.reco.pfp.trk.end.y',
         'rec.slc.reco.pfp.trk.end.z',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_kaon',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_kaon',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_kaon',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_muon',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_muon',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_muon',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_proton',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_proton',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_proton',
     ]
 
@@ -288,21 +299,41 @@ def _extract_base_track_df(f: dict):
     slice_idx_names = list(pandora_df.index.names)[:-1]
     pfp_idx_col = pandora_df.index.names[-1]
 
+    # PRE-CUT: Drop clear cosmics to save space
+    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
+    if isinstance(slc_df.columns, pd.MultiIndex):
+        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
+    is_cosmic = slc_df['is_clear_cosmic'] == 1
+    is_cosmic.name = 'is_cosmic'
+    pandora_joined = pandora_df.join(is_cosmic, on=slice_idx_names)
+    pandora_df = pandora_joined[~pandora_joined['is_cosmic']].drop(columns=['is_cosmic'])
+
+    # --- CALO VARIATIONS ---
+    det = ph.loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
+    det = "SBND" if (1 == det.unique()) else "ICARUS"
+
+    hdrdf = make_mchdrdf(f)
+    ismc = hdrdf.ismc.iloc[0]
+
+    for plane in [0, 1, 2]:
+        # Load track hits for this plane
+        trkhitdf = make_trkhitdf(f, plane)
+        trkhitdf = trkhitdf[util.InFV(df=trkhitdf, det=det)]
+
+        for var_name, calo_params in chi2pid.CALO_VARIATIONS.items():
+            if var_name == "cv":
+                continue
+            # Calculate new dE/dx
+            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params)
+            trkhitdf["dedx_redo"] = dedx_redo
+
+            # Recalculate Chi2 for Muon, Proton, and Kaon
+            for par in ['muon', 'proton', 'kaon']:
+                this_chi2_new, _ = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
+                pandora_df[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_{par}_{var_name}")] = this_chi2_new.fillna(0.)
+    # -----------------------
+
     flat_df = pandora_df.loc[:, ~pandora_df.columns.duplicated()].reset_index(level=pfp_idx_col)
-
-    # --- CALO VARIATIONS (Dummy Implementation) ---
-    variations = {
-        "ccal_p": 1.02, "ccal_m": 0.98,
-        "alpha_p": 1.05, "alpha_m": 0.95,
-        "beta_p": 1.03, "beta_m": 0.97,
-        "R_p": 1.04, "R_m": 0.96,
-    }
-
-    for var_name, dummy_factor in variations.items():
-        flat_df[("pfp", "trk", "chi2pid", "I2", f"chi2_muon_{var_name}")] = flat_df[("pfp", "trk", "chi2pid", "I2", "chi2_muon")] * dummy_factor
-        flat_df[("pfp", "trk", "chi2pid", "I2", f"chi2_proton_{var_name}")] = flat_df[("pfp", "trk", "chi2pid", "I2", "chi2_proton")] * dummy_factor
-        flat_df[("pfp", "trk", "chi2pid", "I2", f"chi2_kaon_{var_name}")] = flat_df[("pfp", "trk", "chi2pid", "I2", "chi2_kaon")] * dummy_factor
-    # ----------------------------------------------
 
     # Rename complex awkward tuples to flat sensible names
     pfp_col_key = (pfp_idx_col, '', '', '', '')
@@ -314,16 +345,26 @@ def _extract_base_track_df(f: dict):
         ("pfp", "trk", "end", "y", ""): "end_y",
         ("pfp", "trk", "end", "z", ""): "end_z",
         ("pfp", "trk", "len", "", ""): "trk_len",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton",
+        ("pfp", "trk", "chi2pid", "I0", "chi2_kaon"): "chi2_kaon_I0",
+        ("pfp", "trk", "chi2pid", "I0", "chi2_muon"): "chi2_muon_I0",
+        ("pfp", "trk", "chi2pid", "I0", "chi2_proton"): "chi2_proton_I0",
+        ("pfp", "trk", "chi2pid", "I1", "chi2_kaon"): "chi2_kaon_I1",
+        ("pfp", "trk", "chi2pid", "I1", "chi2_muon"): "chi2_muon_I1",
+        ("pfp", "trk", "chi2pid", "I1", "chi2_proton"): "chi2_proton_I1",
+        ("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon_I2",
+        ("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon_I2",
+        ("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton_I2",
         pfp_col_key: "pfp_index",
     }
 
-    for var in variations.keys():
-        col_map[("pfp", "trk", "chi2pid", "I2", f"chi2_muon_{var}")] = f"chi2_muon_{var}"
-        col_map[("pfp", "trk", "chi2pid", "I2", f"chi2_proton_{var}")] = f"chi2_proton_{var}"
-        col_map[("pfp", "trk", "chi2pid", "I2", f"chi2_kaon_{var}")] = f"chi2_kaon_{var}"
+    # Add systematic columns to col_map
+    for var_name in chi2pid.CALO_VARIATIONS.keys():
+        if var_name == "cv":
+            continue
+        for plane in [0, 1, 2]:
+            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
+            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
+            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_kaon_{var_name}")] = f"chi2_kaon_I{plane}_{var_name}"
 
     cols_to_keep = {k: v for k, v in col_map.items() if k in flat_df.columns}
     clean_df = flat_df[list(cols_to_keep.keys())].copy()
