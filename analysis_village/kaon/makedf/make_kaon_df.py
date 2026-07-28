@@ -304,9 +304,9 @@ def _extract_base_track_df(f: dict):
     if isinstance(slc_df.columns, pd.MultiIndex):
         slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
     is_cosmic = slc_df['is_clear_cosmic'] == 1
-    is_cosmic.name = 'is_cosmic'
-    pandora_joined = pandora_df.join(is_cosmic, on=slice_idx_names)
-    pandora_df = pandora_joined[~pandora_joined['is_cosmic']].drop(columns=['is_cosmic'])
+    levels_to_drop = list(range(is_cosmic.index.nlevels, pandora_df.index.nlevels))
+    is_cosmic_aligned = is_cosmic.reindex(pandora_df.index.droplevel(levels_to_drop))
+    pandora_df = pandora_df[~is_cosmic_aligned.values]
 
     # --- CALO VARIATIONS ---
     det = ph.loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
