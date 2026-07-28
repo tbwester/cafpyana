@@ -318,7 +318,7 @@ def _extract_base_track_df(f: dict):
     for plane in [0, 1, 2]:
         # Load track hits for this plane
         trkhitdf = make_trkhitdf(f, plane)
-        trkhitdf = trkhitdf[util.InFV(df=trkhitdf, det=det)]
+        trkhitdf = trkhitdf[InFV_SBND(df=trkhitdf)]
 
         for var_name, calo_params in chi2pid.CALO_VARIATIONS.items():
             if var_name == "cv":
