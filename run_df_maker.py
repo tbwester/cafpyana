@@ -56,7 +56,7 @@ def run_pool(output, inputs, nproc):
     output = pathlib.Path(output).with_suffix('.df')
     k_idx = 0
     split_margin = args.SplitSize
-    with pd.HDFStore(output) as hdf_pd:
+    with pd.HDFStore(output, complevel=4, complib="blosc") as hdf_pd:
         NAMES.append("histpotdf")
         NAMES.append("histgenevtdf")
         size_counters = {k: 0 for k in NAMES}
