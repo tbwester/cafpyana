@@ -12,6 +12,36 @@ KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
 TRUE_KE_CUT = 0.
 
+# Final-state species counted per true interaction: (pdg, mass GeV, KE cut GeV).
+# The counts are needed for studies that select on matched final states, e.g.
+# comparing the systematic budget for 1-pion against 1-kaon topologies.
+#
+# Thresholds approximate SBND reconstruction thresholds; they are deliberately
+# fixed rather than tuned. A cut of 0. means "count all":
+#   pi0/Lambda  decay immediately, the daughters carry the real threshold
+#   neutron     not reconstructable; stored for truth bookkeeping only, do NOT
+#               use it in a "matched final state" definition
+#   kaons       true kaon KE is stored separately (true_E_kaon/true_P_kaon), so
+#               the kaon threshold is applied downstream, on the fly
+PRIM_SPECIES = {
+    "n_piplus":  (  211, 0.139570, 0.025),
+    "n_piminus": ( -211, 0.139570, 0.025),
+    "n_pi0":     (  111, 0.134977, 0.0),
+    "n_kplus":   (  321, 0.493677, 0.0),
+    "n_kminus":  ( -321, 0.493677, 0.0),
+    "n_k0":      (  311, 0.497611, 0.0),
+    "n_klong":   (  130, 0.497611, 0.0),
+    "n_kshort":  (  310, 0.497611, 0.0),
+    "n_proton":  ( 2212, 0.938272, 0.050),
+    "n_neutron": ( 2112, 0.939565, 0.0),
+    "n_mu":      (   13, 0.105658, 0.025),
+    "n_mubar":   (  -13, 0.105658, 0.025),
+    "n_e":       (   11, 0.000511, 0.010),
+    "n_ebar":    (  -11, 0.000511, 0.010),
+    "n_gamma":   (   22, 0.0,      0.010),
+    "n_lambda":  ( 3122, 1.115683, 0.0),
+}
+
 InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
 
 def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.Series:
@@ -131,9 +161,6 @@ def make_true_type_df(f) -> pd.DataFrame:
     kplus_mask = (mcprimdf.pdg == KPDG['kplus'])
     kplus_df = mcprimdf[kplus_mask].copy()
 
-    ke = kplus_df.genE - KMASS['kplus']
-    nkplus = (ke > TRUE_KE_CUT).groupby(level=[0, 1]).sum()
-
     kplus_first = kplus_df.groupby(level=[0, 1]).first()
     true_E_kaon = kplus_first['genE']
     true_P_kaon = np.sqrt(np.maximum(0, true_E_kaon**2 - KMASS['kplus']**2)).fillna(0)
@@ -167,8 +194,11 @@ def make_true_type_df(f) -> pd.DataFrame:
     res['is_true_fv'] = is_true_fv.fillna(False).astype(bool)
     res['true_E_nu'] = true_E_nu
 
-    res['nkplus'] = nkplus
-    res['nkplus'] = res['nkplus'].fillna(0).astype(int)
+    # Final-state multiplicities above threshold, one column per species.
+    # n_kplus supersedes the old standalone 'nkplus'.
+    for _name, (_pdg, _mass, _ke_cut) in PRIM_SPECIES.items():
+        _sel = (mcprimdf.pdg == _pdg) & ((mcprimdf.genE - _mass) > _ke_cut)
+        res[_name] = _sel.groupby(level=[0, 1]).sum().fillna(0).astype(int)
 
     res['true_E_kaon'] = true_E_kaon
     res['true_E_kaon'] = res['true_E_kaon'].fillna(0)
@@ -185,9 +215,9 @@ def make_true_type_df(f) -> pd.DataFrame:
     true_type = pd.Series(np.nan, index=res.index)
 
     true_type[~res['is_true_fv']] = 99
-    true_type[res['is_true_fv'] & (res['nkplus'] < 1)] = 98
+    true_type[res['is_true_fv'] & (res['n_kplus'] < 1)] = 98
 
-    is_k_fv = res['is_true_fv'] & (res['nkplus'] > 0)
+    is_k_fv = res['is_true_fv'] & (res['n_kplus'] > 0)
     true_type[is_k_fv & (res['k_daughter_pdg'] == -13)] = 1
     true_type[is_k_fv & (res['k_daughter_pdg'] == 211)] = 2
     true_type[is_k_fv & res['is_k_contained'] & true_type.isna()] = 3
@@ -195,8 +225,11 @@ def make_true_type_df(f) -> pd.DataFrame:
 
     res['true_type'] = true_type.astype(int)
 
-    # Return exactly the 6 columns we need downstream!
-    keep_cols = ['true_type', 'is_cc', 'is_k_contained', 'true_E_nu', 'true_E_kaon', 'true_P_kaon']
+    # is_true_fv was previously computed and then dropped; it is needed to
+    # reconstruct the true_type decision downstream.
+    keep_cols = (['true_type', 'is_cc', 'is_true_fv', 'is_k_contained',
+                  'true_E_nu', 'true_E_kaon', 'true_P_kaon']
+                 + list(PRIM_SPECIES))
     return res[keep_cols]
 
 
@@ -293,6 +326,9 @@ def _extract_base_track_df(f: dict):
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_proton',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_proton',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_proton',
+        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_pion',
+        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_pion',
+        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_pion',
     ]
 
     pandora_df = ph.loadbranches(f["recTree"], branches_to_load).rec.slc.reco
@@ -327,8 +363,8 @@ def _extract_base_track_df(f: dict):
             dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params)
             trkhitdf["dedx_redo"] = dedx_redo
 
-            # Recalculate Chi2 for Muon, Proton, and Kaon
-            for par in ['muon', 'proton', 'kaon']:
+            # Recalculate Chi2 for Muon, Proton, Kaon and Pion
+            for par in ['muon', 'proton', 'kaon', 'pion']:
                 this_chi2_new, _ = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
                 pandora_df[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_{par}_{var_name}")] = this_chi2_new.fillna(0.)
     # -----------------------
@@ -354,6 +390,9 @@ def _extract_base_track_df(f: dict):
         ("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon_I2",
         ("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon_I2",
         ("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton_I2",
+        ("pfp", "trk", "chi2pid", "I0", "chi2_pion"): "chi2_pion_I0",
+        ("pfp", "trk", "chi2pid", "I1", "chi2_pion"): "chi2_pion_I1",
+        ("pfp", "trk", "chi2pid", "I2", "chi2_pion"): "chi2_pion_I2",
         pfp_col_key: "pfp_index",
     }
 
@@ -365,6 +404,7 @@ def _extract_base_track_df(f: dict):
             col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
             col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
             col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_kaon_{var_name}")] = f"chi2_kaon_I{plane}_{var_name}"
+            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_pion_{var_name}")] = f"chi2_pion_I{plane}_{var_name}"
 
     cols_to_keep = {k: v for k, v in col_map.items() if k in flat_df.columns}
     clean_df = flat_df[list(cols_to_keep.keys())].copy()
