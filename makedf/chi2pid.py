@@ -33,18 +33,33 @@ SBND_CALO_PARAMS = {
 }
 
 
+def _vary(params, key, delta):
+    """Offset a [MC, data] calo parameter by delta, preserving each centre.
+
+    dedx() selects params[key][0] for MC and params[key][1] for data, and the
+    two centres differ. Hardcoding the MC centre in both slots turns the data
+    "variation" into a shift of the central value -- for beta_90 and R_emb it
+    puts both +1 and -1 sigma on the same side of the data nominal, which
+    breaks any symmetrised covariance built from them.
+    """
+    base = params[key]
+    return {**params, key: [base[0] + delta, base[1] + delta]}
+
+
 # calo variations
 # variations on recombination parameters are taken from the ICARUS measurement uncertainties
+# NB: c_cal_frac is indexed BY PLANE (3 entries), unlike alpha_emb/beta_90/R_emb
+# which are indexed BY isMC (2 entries), so _vary() does not apply to it.
 CALO_VARIATIONS = {
     "cv": SBND_CALO_PARAMS,
     "ccal_p": {**SBND_CALO_PARAMS, "c_cal_frac": [1.02, 1.02, 1.02]},
     "ccal_m": {**SBND_CALO_PARAMS, "c_cal_frac": [0.98, 0.98, 0.98]},
-    "alpha_p": {**SBND_CALO_PARAMS, "alpha_emb": [0.904+0.008, 0.904+0.008]},
-    "alpha_m": {**SBND_CALO_PARAMS, "alpha_emb": [0.904-0.008, 0.904-0.008]},
-    "beta_p": {**SBND_CALO_PARAMS, "beta_90": [0.204+0.008, 0.204+0.008]},
-    "beta_m": {**SBND_CALO_PARAMS, "beta_90": [0.204-0.008, 0.204-0.008]},
-    "R_p": {**SBND_CALO_PARAMS, "R_emb": [1.25+0.02, 1.25+0.02]},
-    "R_m": {**SBND_CALO_PARAMS, "R_emb": [1.25-0.02, 1.25-0.02]},
+    "alpha_p": _vary(SBND_CALO_PARAMS, "alpha_emb", +0.008),
+    "alpha_m": _vary(SBND_CALO_PARAMS, "alpha_emb", -0.008),
+    "beta_p":  _vary(SBND_CALO_PARAMS, "beta_90",   +0.008),
+    "beta_m":  _vary(SBND_CALO_PARAMS, "beta_90",   -0.008),
+    "R_p":     _vary(SBND_CALO_PARAMS, "R_emb",     +0.02),
+    "R_m":     _vary(SBND_CALO_PARAMS, "R_emb",     -0.02),
 }
 
 
@@ -71,6 +86,9 @@ def chi2p(hitdf, dedxname="dedx"):
 def chi2k(hitdf, dedxname="dedx"):
     return chi2(hitdf, kaon_rr, kaon_dedx, kaon_yerr, dedxname)
 
+def chi2pi(hitdf, dedxname="dedx"):
+    return chi2(hitdf, pion_rr, pion_dedx, pion_yerr, dedxname)
+
 def chi2par(hitdf, dedxname="dedx", par=""):
     if par == "muon":
         return chi2u(hitdf, dedxname)
@@ -78,8 +96,10 @@ def chi2par(hitdf, dedxname="dedx", par=""):
         return chi2p(hitdf, dedxname)
     elif par == "kaon":
         return chi2k(hitdf, dedxname)
+    elif par == "pion":
+        return chi2pi(hitdf, dedxname)
     else:
-        raise ValueError(f"Invalid par={par!r}. Expected 'muon', 'proton', or 'kaon'.")
+        raise ValueError(f"Invalid par={par!r}. Expected 'muon', 'proton', 'kaon', or 'pion'.")
 
 def chi2_ndof(hitdf):
     when_chi2 = (hitdf.rr < rr_max_cut_chi2) & ~hitdf.firsthit & ~hitdf.lasthit & (hitdf.dedx < 1000.)
@@ -266,6 +286,7 @@ fhist = datadir + "dEdxrestemplates.root"
 profp = uproot.open(fhist)["dedx_range_pro"]
 profmu = uproot.open(fhist)["dedx_range_mu"]
 profka = uproot.open(fhist)["dedx_range_ka"]
+profpi = uproot.open(fhist)["dedx_range_pi"]
 
 proton_dedx = profp.values()
 proton_rr = profp.axis().edges()
@@ -289,6 +310,15 @@ muon_dedx = profmu.values()
 muon_rr = profmu.axis().edges()
 muon_rr_center = profmu.axis().centers()
 muon_yerr = profmu.errors(error_mode="s")
+
+pion_dedx = profpi.values()
+pion_rr = profpi.axis().edges()
+pion_yerr = profpi.errors(error_mode="s")
+for i in range(len(pion_yerr)):
+    if pion_yerr[i] < 1e-6:
+        pion_yerr[i] = (pion_yerr[i-1] + pion_yerr[i+1]) / 2
+    if pion_dedx[i] < 1e-6:
+        pion_dedx[i] = (pion_dedx[i-1] + pion_dedx[i+1]) / 2
 
 ##############################
 # ICARUS TPC calo files
