@@ -44,13 +44,26 @@ PRIM_SPECIES = {
 
 InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
 
-def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.Series:
+def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.DataFrame:
     """
     Signal identification using backward hierarchy traversal.
-    Returns a Series mapping (entry, interaction_id) -> daughter_pdg.
+
+    Returns a DataFrame indexed by (entry, interaction_id) with columns:
+        daughter_pdg      the MIP type the kaon decayed to (-13 or 211)
+        n_k_interactions  how many hadronic interactions the kaon underwent
+                          before producing that MIP
+
     Handles arbitrary scattering depths and preserves the MIP type.
+
+    n_k_interactions counts kaon->kaon steps in the chain, so 0 means the
+    primary kaon decayed straight to the MIP, 1 means it re-interacted once and
+    the resulting kaon segment decayed, and so on. Each iteration of the
+    traversal below walks back exactly one generation, and every row in
+    `active` sits at the same depth by construction, so a scalar counter is
+    sufficient.
     """
-    nulldf = pd.Series(dtype=float, name='k_daughter_pdg')
+    nullcols = ['daughter_pdg', 'n_k_interactions']
+    nulldf = pd.DataFrame(columns=nullcols, dtype=float)
     if tpartdf.empty:
         return nulldf
 
@@ -80,6 +93,7 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     signal_results = []
     k_pdg = KPDG[ktype]
     is_first_step = True
+    n_k_interactions = 0
 
     while not active.empty:
         parents = active.merge(
@@ -114,7 +128,9 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
 
         successes = parents[is_primary_k]
         if not successes.empty:
-            signal_results.append(successes[['entry', 'interaction_id', 'daughter_pdg']])
+            found = successes[['entry', 'interaction_id', 'daughter_pdg']].copy()
+            found['n_k_interactions'] = n_k_interactions
+            signal_results.append(found)
 
         active = parents[is_k_parent & ~is_primary_k].copy()
         if not active.empty:
@@ -127,6 +143,9 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
             active['parent'] = active['parent_p']
             active = active[['entry', 'G4ID', 'parent', 'interaction_id', 'daughter_pdg']]
 
+        # every surviving row has stepped back one more kaon generation
+        n_k_interactions += 1
+
     if not signal_results:
         return nulldf
 
@@ -136,7 +155,14 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     unambiguous = counts[counts == 1].index
 
     final_pdgs = res_df.set_index(['entry', 'interaction_id']).loc[unambiguous]
-    return final_pdgs.groupby(level=[0, 1]).first().daughter_pdg
+    # daughter_pdg is unique within each group by the `unambiguous` filter, so
+    # 'first' is well defined. n_k_interactions is NOT: an interaction can hold
+    # several MIPs of the same type from different kaons, each with its own
+    # chain length. Take the shortest -- the least-reinteracted association.
+    return final_pdgs.groupby(level=[0, 1]).agg(
+        daughter_pdg=('daughter_pdg', 'first'),
+        n_k_interactions=('n_k_interactions', 'min'),
+    )
 
 
 def make_true_type_df(f) -> pd.DataFrame:
@@ -186,7 +212,7 @@ def make_true_type_df(f) -> pd.DataFrame:
     tpartdf = ph.loadbranches(f["recTree"], tpart_branches).rec.true_particles
     tpartdf = tpartdf.reset_index().set_index(['entry', 'G4ID'])
 
-    k_daughter_pdg = k_has_daughter(tpartdf, 'kplus', require_contained=True)
+    k_info = k_has_daughter(tpartdf, 'kplus', require_contained=True)
 
     # 4. Consolidate into our minimal dataframe
     res = pd.DataFrame(index=mcdf.index)
@@ -209,7 +235,12 @@ def make_true_type_df(f) -> pd.DataFrame:
     res['is_k_contained'] = is_k_contained
     res['is_k_contained'] = res['is_k_contained'].fillna(False).astype(bool)
 
-    res['k_daughter_pdg'] = k_daughter_pdg
+    res['k_daughter_pdg'] = k_info['daughter_pdg']
+
+    # Number of hadronic interactions the matched kaon underwent. -1 means no
+    # kaon -> MIP chain was matched at all, which is not the same as 0.
+    res['n_k_interactions'] = k_info['n_k_interactions']
+    res['n_k_interactions'] = res['n_k_interactions'].fillna(-1).astype(int)
 
     # 5. Compute 'true_type' (Standard 1, 2, 3, 4, 98, 99)
     true_type = pd.Series(np.nan, index=res.index)
@@ -228,7 +259,7 @@ def make_true_type_df(f) -> pd.DataFrame:
     # is_true_fv was previously computed and then dropped; it is needed to
     # reconstruct the true_type decision downstream.
     keep_cols = (['true_type', 'is_cc', 'is_true_fv', 'is_k_contained',
-                  'true_E_nu', 'true_E_kaon', 'true_P_kaon']
+                  'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions']
                  + list(PRIM_SPECIES))
     return res[keep_cols]
 
