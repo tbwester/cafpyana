@@ -639,6 +639,7 @@ def _extract_base_track_df(f: dict):
     all systematic calorimetry variations.
     """
     branches_to_load = [
+        'rec.slc.reco.pfp.trackScore',
         'rec.slc.reco.pfp.trk.len',
         'rec.slc.reco.pfp.trk.start.x',
         'rec.slc.reco.pfp.trk.start.y',
@@ -709,6 +710,7 @@ def _extract_base_track_df(f: dict):
         ("pfp", "trk", "end", "x", ""): "end_x",
         ("pfp", "trk", "end", "y", ""): "end_y",
         ("pfp", "trk", "end", "z", ""): "end_z",
+        ("pfp", "trackScore", "", "", ""): "trackScore",
         ("pfp", "trk", "len", "", ""): "trk_len",
         ("pfp", "trk", "chi2pid", "I0", "chi2_kaon"): "chi2_kaon_I0",
         ("pfp", "trk", "chi2pid", "I0", "chi2_muon"): "chi2_muon_I0",
@@ -797,9 +799,14 @@ def make_track_df(f: dict) -> pd.DataFrame:
     return track_df
 
 
-def make_pair_df(f: dict, proximity_cm: float = 1.0) -> pd.DataFrame:
+def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
     """
     Extracts PFP pair features from a flatcaf file for Pair BDT training and evaluation.
+
+    proximity_cm is the widest separation the products will ever hold, not the
+    analysis cut. Kept loose deliberately: dist_to_parent_end is exported per
+    pair, so a downstream selection can tighten it, but it can never recover
+    pairs the products never built. The pair BDT selection cuts at 2.0 cm.
     """
     track_df, slice_idx_names = _base_track_df(f)
     if track_df.empty:
