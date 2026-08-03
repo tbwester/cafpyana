@@ -448,7 +448,8 @@ def make_true_type_df(f) -> pd.DataFrame:
     Creates a minimal dataframe with exactly 1 row per true neutrino interaction.
     """
     # 1. Load basic neutrino info
-    nu_branches = ['rec.mc.nu.E', 'rec.mc.nu.iscc', 'rec.mc.nu.position.x', 'rec.mc.nu.position.y', 'rec.mc.nu.position.z']
+    nu_branches = ['rec.mc.nu.E', 'rec.mc.nu.iscc', 'rec.mc.nu.genie_mode',
+                   'rec.mc.nu.position.x', 'rec.mc.nu.position.y', 'rec.mc.nu.position.z']
     mcdf = ph.loadbranches(f["recTree"], nu_branches).rec.mc.nu
 
     is_cc = mcdf['iscc'] == 1
@@ -485,6 +486,14 @@ def make_true_type_df(f) -> pd.DataFrame:
     res['is_cc'] = is_cc.fillna(False).astype(bool)
     res['is_true_fv'] = is_true_fv.fillna(False).astype(bool)
     res['true_E_nu'] = true_E_nu
+
+    # GENIE interaction mode, as the raw genie::EScatteringType integer
+    # (0 QE, 1 RES, 2 DIS, 3 COH, 10 MEC, ...). Deliberately not mapped to
+    # labels here: the mapping is a presentation choice, and a value this
+    # code does not recognise has to stay visible rather than fall into an
+    # "other" bucket. -1 means the interaction carries no mode at all, which
+    # is not the same as mode 0.
+    res['genie_mode'] = mcdf['genie_mode'].fillna(-1).astype(int)
 
     # Final-state multiplicities above threshold, one column per species.
     # n_kplus supersedes the old standalone 'nkplus'.
@@ -555,7 +564,7 @@ def make_true_type_df(f) -> pd.DataFrame:
 
     # is_true_fv was previously computed and then dropped; it is needed to
     # reconstruct the true_type decision downstream.
-    keep_cols = (['true_type', 'is_cc', 'is_true_fv', 'is_k_contained',
+    keep_cols = (['true_type', 'is_cc', 'genie_mode', 'is_true_fv', 'is_k_contained',
                   'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions']
                  + list(KORIGIN_COUNT_COLS.values())
                  + list(PRIM_SPECIES))
@@ -574,7 +583,16 @@ def make_slice_df(f: dict) -> pd.DataFrame:
         'rec.slc.nu_score',
         'rec.slc.is_clear_cosmic',
         'rec.slc.barycenterFM.score',
-        'rec.slc.tmatch.index'
+        'rec.slc.tmatch.index',
+        # The reconstructed slice vertex. legacy_make_kaon_df.make_kaon_recodf
+        # applied InFV_SBND(slc.vertex) as a production pre-cut, so kaonana's
+        # cutflow inherited it and the pair BDT was trained downstream of it --
+        # but it is in no cut sequence and in none of the new products, so the
+        # port has been running without it. Exported rather than applied, per
+        # the analysis-time-filtering policy: 3 floats on the smallest table.
+        'rec.slc.vertex.x',
+        'rec.slc.vertex.y',
+        'rec.slc.vertex.z',
     ]
 
     # Load slice branches
@@ -659,6 +677,30 @@ def _extract_base_track_df(f: dict):
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_pion',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_pion',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_pion',
+        # Backtracked truth of the track's best-matched true particle. Needed
+        # to say what a selected pair actually was -- chi2 PID answers what it
+        # looks like, which is a different question and the only one the
+        # products could answer before this.
+        'rec.slc.reco.pfp.trk.truth.p.pdg',
+        'rec.slc.reco.pfp.trk.truth.p.G4ID',
+        'rec.slc.reco.pfp.trk.truth.p.interaction_id',
+        'rec.slc.reco.pfp.trk.truth.p.genE',
+        # parent and the true trajectory end points are what a *pair* label
+        # needs, as opposed to a single track's identity:
+        #   parent      daughter.truth_parent == parent.truth_G4ID is the test
+        #               that this daughter really is that parent's decay
+        #               product, rather than a coincidental muon in the slice.
+        #   start/end   the true containment of both legs.
+        # Together with pdg these are the four terms in
+        # pair_bdt/scripts/extract_nu_pairs.py's signal definition; without
+        # them a retrain cannot label its own training set.
+        'rec.slc.reco.pfp.trk.truth.p.parent',
+        'rec.slc.reco.pfp.trk.truth.p.start.x',
+        'rec.slc.reco.pfp.trk.truth.p.start.y',
+        'rec.slc.reco.pfp.trk.truth.p.start.z',
+        'rec.slc.reco.pfp.trk.truth.p.end.x',
+        'rec.slc.reco.pfp.trk.truth.p.end.y',
+        'rec.slc.reco.pfp.trk.truth.p.end.z',
     ]
 
     pandora_df = ph.loadbranches(f["recTree"], branches_to_load).rec.slc.reco
@@ -701,29 +743,61 @@ def _extract_base_track_df(f: dict):
 
     flat_df = pandora_df.loc[:, ~pandora_df.columns.duplicated()].reset_index(level=pfp_idx_col)
 
+    # loadbranches sets the column arity from the DEEPEST branch requested and
+    # pads everything shallower with trailing "". So adding a branch one level
+    # deeper than the previous deepest renumbers *every* key below.
+    # truth.p.start.x is exactly that case: 6 levels against chi2pid's 5.
+    #
+    # This does fail rather than pass quietly, but it fails unrecognisably --
+    # the hardcoded 5-tuples still test True against a 6-level MultiIndex
+    # (pandas reads a short tuple as a partial key), so cols_to_keep looks
+    # right and the frame selection below then raises a bare
+    #   AssertionError: Length of new_levels (6) must be <= self.nlevels (5)
+    # from inside pandas, which says nothing about branch depth. Keys are
+    # therefore given at their natural depth and padded to the frame's arity
+    # here, so adding a deeper branch needs no edits below and a key that is
+    # genuinely too deep raises with its own name in the message.
+    _depth = flat_df.columns.nlevels
+
+    def _key(*parts):
+        if len(parts) > _depth:
+            raise ValueError(f"column key {parts} is deeper than the frame ({_depth} levels)")
+        return tuple(parts) + ("",) * (_depth - len(parts))
+
     # Rename complex awkward tuples to flat sensible names
-    pfp_col_key = (pfp_idx_col, '', '', '', '')
+    pfp_col_key = _key(pfp_idx_col)
     col_map = {
-        ("pfp", "trk", "start", "x", ""): "start_x",
-        ("pfp", "trk", "start", "y", ""): "start_y",
-        ("pfp", "trk", "start", "z", ""): "start_z",
-        ("pfp", "trk", "end", "x", ""): "end_x",
-        ("pfp", "trk", "end", "y", ""): "end_y",
-        ("pfp", "trk", "end", "z", ""): "end_z",
-        ("pfp", "trackScore", "", "", ""): "trackScore",
-        ("pfp", "trk", "len", "", ""): "trk_len",
-        ("pfp", "trk", "chi2pid", "I0", "chi2_kaon"): "chi2_kaon_I0",
-        ("pfp", "trk", "chi2pid", "I0", "chi2_muon"): "chi2_muon_I0",
-        ("pfp", "trk", "chi2pid", "I0", "chi2_proton"): "chi2_proton_I0",
-        ("pfp", "trk", "chi2pid", "I1", "chi2_kaon"): "chi2_kaon_I1",
-        ("pfp", "trk", "chi2pid", "I1", "chi2_muon"): "chi2_muon_I1",
-        ("pfp", "trk", "chi2pid", "I1", "chi2_proton"): "chi2_proton_I1",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon_I2",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon_I2",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton_I2",
-        ("pfp", "trk", "chi2pid", "I0", "chi2_pion"): "chi2_pion_I0",
-        ("pfp", "trk", "chi2pid", "I1", "chi2_pion"): "chi2_pion_I1",
-        ("pfp", "trk", "chi2pid", "I2", "chi2_pion"): "chi2_pion_I2",
+        _key("pfp", "trk", "start", "x"): "start_x",
+        _key("pfp", "trk", "start", "y"): "start_y",
+        _key("pfp", "trk", "start", "z"): "start_z",
+        _key("pfp", "trk", "end", "x"): "end_x",
+        _key("pfp", "trk", "end", "y"): "end_y",
+        _key("pfp", "trk", "end", "z"): "end_z",
+        _key("pfp", "trackScore"): "trackScore",
+        _key("pfp", "trk", "len"): "trk_len",
+        _key("pfp", "trk", "chi2pid", "I0", "chi2_kaon"): "chi2_kaon_I0",
+        _key("pfp", "trk", "chi2pid", "I0", "chi2_muon"): "chi2_muon_I0",
+        _key("pfp", "trk", "chi2pid", "I0", "chi2_proton"): "chi2_proton_I0",
+        _key("pfp", "trk", "chi2pid", "I1", "chi2_kaon"): "chi2_kaon_I1",
+        _key("pfp", "trk", "chi2pid", "I1", "chi2_muon"): "chi2_muon_I1",
+        _key("pfp", "trk", "chi2pid", "I1", "chi2_proton"): "chi2_proton_I1",
+        _key("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon_I2",
+        _key("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon_I2",
+        _key("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton_I2",
+        _key("pfp", "trk", "chi2pid", "I0", "chi2_pion"): "chi2_pion_I0",
+        _key("pfp", "trk", "chi2pid", "I1", "chi2_pion"): "chi2_pion_I1",
+        _key("pfp", "trk", "chi2pid", "I2", "chi2_pion"): "chi2_pion_I2",
+        _key("pfp", "trk", "truth", "p", "pdg"): "truth_pdg",
+        _key("pfp", "trk", "truth", "p", "G4ID"): "truth_G4ID",
+        _key("pfp", "trk", "truth", "p", "parent"): "truth_parent",
+        _key("pfp", "trk", "truth", "p", "interaction_id"): "truth_interaction_id",
+        _key("pfp", "trk", "truth", "p", "genE"): "truth_genE",
+        _key("pfp", "trk", "truth", "p", "start", "x"): "truth_start_x",
+        _key("pfp", "trk", "truth", "p", "start", "y"): "truth_start_y",
+        _key("pfp", "trk", "truth", "p", "start", "z"): "truth_start_z",
+        _key("pfp", "trk", "truth", "p", "end", "x"): "truth_end_x",
+        _key("pfp", "trk", "truth", "p", "end", "y"): "truth_end_y",
+        _key("pfp", "trk", "truth", "p", "end", "z"): "truth_end_z",
         pfp_col_key: "pfp_index",
     }
 
@@ -732,14 +806,40 @@ def _extract_base_track_df(f: dict):
         if var_name == "cv":
             continue
         for plane in [0, 1, 2]:
-            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
-            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
-            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_kaon_{var_name}")] = f"chi2_kaon_I{plane}_{var_name}"
-            col_map[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_pion_{var_name}")] = f"chi2_pion_I{plane}_{var_name}"
+            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
+            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
+            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_kaon_{var_name}")] = f"chi2_kaon_I{plane}_{var_name}"
+            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_pion_{var_name}")] = f"chi2_pion_I{plane}_{var_name}"
 
     cols_to_keep = {k: v for k, v in col_map.items() if k in flat_df.columns}
     clean_df = flat_df[list(cols_to_keep.keys())].copy()
     clean_df.columns = list(cols_to_keep.values())
+
+    # A track with no backtracked particle carries INT_MIN in every truth
+    # column, which is a number a histogram or a mean will happily consume.
+    # Map it onto sentinels that cannot be mistaken for data:
+    #   truth_pdg  0   no particle has pdg 0, so this is THE unmatched test
+    #   truth_G4ID 0   G4 numbers particles from 1
+    #   truth_interaction_id -1  the CAF already uses -1 for a cosmic-origin
+    #                            particle, and "not from a neutrino
+    #                            interaction" is the only distinction that
+    #                            matters downstream; truth_pdg == 0 still
+    #                            separates unmatched from genuinely cosmic
+    #   truth_parent -1  NOT 0: G4 uses parent == 0 for a primary, so mapping
+    #                    unmatched onto 0 would make an unmatched track read as
+    #                    the child of a primary. -1 is already the CAF's
+    #                    "not from a neutrino interaction" value.
+    #   truth_genE NaN  already NaN out of the CAF, left alone
+    #   truth_start_*, truth_end_*  float, and left alone for the same reason
+    #                    as genE. If a build ever does put INT_MIN in them the
+    #                    failure mode is safe: util.InFV(-2.1e9) is False, so
+    #                    an unmatched track reads as uncontained and cannot be
+    #                    labelled signal.
+    _unmatched = np.iinfo(np.int32).min
+    for _col, _fill in (("truth_pdg", 0), ("truth_G4ID", 0), ("truth_parent", -1),
+                        ("truth_interaction_id", -1)):
+        if _col in clean_df.columns:
+            clean_df[_col] = clean_df[_col].replace(_unmatched, _fill).astype(int)
 
     # Restore index: entry and slice index are already in the index, so just append pfp_index
     clean_df = clean_df.set_index("pfp_index", append=True).sort_index()
@@ -820,7 +920,7 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
         "trk_len": "parent_len",
     }
     for c in track_df.columns:
-        if c.startswith("chi2"):
+        if c.startswith(("chi2", "truth_")):
             p_rename[c] = f"parent_{c}"
 
     p_df = track_df[list(p_rename.keys())].copy()
@@ -835,7 +935,7 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
         "trk_len": "daughter_len",
     }
     for c in track_df.columns:
-        if c.startswith("chi2"):
+        if c.startswith(("chi2", "truth_")):
             d_rename[c] = f"daughter_{c}"
 
     d_df = track_df[list(d_rename.keys())].copy()
