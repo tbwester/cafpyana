@@ -716,6 +716,27 @@ def _extract_base_track_df(f: dict):
     is_cosmic_aligned = is_cosmic.reindex(pandora_df.index.droplevel(levels_to_drop))
     pandora_df = pandora_df[~is_cosmic_aligned.values]
 
+    # loadbranches sets the column arity from the DEEPEST branch requested and
+    # pads everything shallower with trailing "". So adding a branch one level
+    # deeper than the previous deepest renumbers *every* key below.
+    # truth.p.start.x is exactly that case: 6 levels against chi2pid's 5.
+    #
+    # This does fail rather than pass quietly, but it fails unrecognisably --
+    # the hardcoded 5-tuples still test True against a 6-level MultiIndex
+    # (pandas reads a short tuple as a partial key), so cols_to_keep looks
+    # right and the frame selection below then raises a bare
+    #   AssertionError: Length of new_levels (6) must be <= self.nlevels (5)
+    # from inside pandas, which says nothing about branch depth. Keys are
+    # therefore given at their natural depth and padded to the frame's arity
+    # here, so adding a deeper branch needs no edits below and a key that is
+    # genuinely too deep raises with its own name in the message.
+    _depth = pandora_df.columns.nlevels
+
+    def _key(*parts):
+        if len(parts) > _depth:
+            raise ValueError(f"column key {parts} is deeper than the frame ({_depth} levels)")
+        return tuple(parts) + ("",) * (_depth - len(parts))
+
     # --- CALO VARIATIONS ---
     det = ph.loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
     det = "SBND" if (1 == det.unique()) else "ICARUS"
@@ -738,31 +759,10 @@ def _extract_base_track_df(f: dict):
             # Recalculate Chi2 for Muon, Proton, Kaon and Pion
             for par in ['muon', 'proton', 'kaon', 'pion']:
                 this_chi2_new, _ = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
-                pandora_df[("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_{par}_{var_name}")] = this_chi2_new.fillna(0.)
+                pandora_df[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_{par}_{var_name}")] = this_chi2_new.fillna(0.)
     # -----------------------
 
     flat_df = pandora_df.loc[:, ~pandora_df.columns.duplicated()].reset_index(level=pfp_idx_col)
-
-    # loadbranches sets the column arity from the DEEPEST branch requested and
-    # pads everything shallower with trailing "". So adding a branch one level
-    # deeper than the previous deepest renumbers *every* key below.
-    # truth.p.start.x is exactly that case: 6 levels against chi2pid's 5.
-    #
-    # This does fail rather than pass quietly, but it fails unrecognisably --
-    # the hardcoded 5-tuples still test True against a 6-level MultiIndex
-    # (pandas reads a short tuple as a partial key), so cols_to_keep looks
-    # right and the frame selection below then raises a bare
-    #   AssertionError: Length of new_levels (6) must be <= self.nlevels (5)
-    # from inside pandas, which says nothing about branch depth. Keys are
-    # therefore given at their natural depth and padded to the frame's arity
-    # here, so adding a deeper branch needs no edits below and a key that is
-    # genuinely too deep raises with its own name in the message.
-    _depth = flat_df.columns.nlevels
-
-    def _key(*parts):
-        if len(parts) > _depth:
-            raise ValueError(f"column key {parts} is deeper than the frame ({_depth} levels)")
-        return tuple(parts) + ("",) * (_depth - len(parts))
 
     # Rename complex awkward tuples to flat sensible names
     pfp_col_key = _key(pfp_idx_col)
