@@ -37,6 +37,8 @@ pair_bdt/scripts/extract_nu_pairs.py's population and labels:
   slice      nu_score, barycenterFM_score and the reconstructed vertex
   true_type  the slice's true_type, which splits is_signal 1 from 2
   hdr        run/subrun/evt, for deduplication against other productions
+  file       one row per input flatcaf, so a training pair can be traced back to
+             the file it came from -- see make_file_df
 
 histpotdf and histgenevtdf are appended by run_df_maker.py regardless.
 
@@ -48,6 +50,7 @@ concatenate a NaN-filled union rather than fail.
 """
 
 from analysis_village.kaon.makedf.make_kaon_df import (
+    make_file_df,
     make_pair_df,
     make_slice_df,
     make_track_df,
@@ -55,5 +58,6 @@ from analysis_village.kaon.makedf.make_kaon_df import (
 )
 from makedf.makedf import make_hdrdf
 
-DFS = [make_true_type_df, make_slice_df, make_track_df, make_pair_df, make_hdrdf]
-NAMES = ["true_type", "slice", "track", "pair", "hdr"]
+DFS = [make_true_type_df, make_slice_df, make_track_df, make_pair_df, make_hdrdf,
+       make_file_df]
+NAMES = ["true_type", "slice", "track", "pair", "hdr", "file"]

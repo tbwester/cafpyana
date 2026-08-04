@@ -7,6 +7,7 @@ from .legacy_make_kaon_df import (
 
 # ruff: noqa: F401
 from .make_kaon_df import (
+    make_file_df,
     make_pair_df,
     make_slice_df,
     make_syst_df,

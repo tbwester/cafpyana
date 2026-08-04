@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import os
 
 import makedf.getsyst as getsyst
 import makedf.util as util
@@ -571,6 +573,106 @@ def make_true_type_df(f) -> pd.DataFrame:
     return res[keep_cols]
 
 
+
+
+# --- file provenance --------------------------------------------------------
+# Which flatcaf a selected slice came from, so an event can be traced back to
+# its input and its hits re-read for a dE/dx profile.
+#
+# The join key already exists. pyanalib.ntuple_glob tags every df it builds with
+# __ntuple, the position of the file in that job's input list, and that level is
+# on every row of every table. What has never existed is the right-hand side of
+# the join: nothing in a product records which file a given __ntuple was. It
+# cannot be reconstructed either -- run_df_maker.run_grid deals the input list
+# round-robin across jobs (flistForEachJob[i_line % ngrid]) and each job
+# renumbers from zero, so recovering it needs ngrid, the list, and which files
+# failed, none of which the product carries.
+#
+# A maker rather than a loader change: _execute_load calls every entry in a
+# config's DFS with the open uproot file, and uproot's ReadOnlyDirectory carries
+# file_path, so the file's own name is reachable from in here and
+# pyanalib/ntuple_glob.py does not have to be touched.
+
+#: ``file_key`` for a file whose name could not be determined.  A real name
+#: collides with this with probability 2**-64.
+UNKNOWN_FILE_KEY = np.uint64(0)
+
+#: ``n_entry`` when the count could not be read.  Not 0, which is a legitimate
+#: answer for a file holding no events.
+UNKNOWN_N_ENTRY = -1
+
+
+def file_key(name: str) -> np.uint64:
+    """64-bit key for a flatcaf basename.
+
+    blake2b, NOT the built-in ``hash()``: string hashing is salted per process,
+    so ``hash()`` would give a different key in every worker of the same run.
+
+    Truncated to 64 bits because that is what fits a numpy column and is
+    comfortably enough -- the birthday collision probability is ~2.7e-8 at 1e6
+    files (32 bits would expect ~116 collisions there, and does not).  Over the
+    14,821 names in ``lists/kex_list.txt`` there are none.
+    """
+    if not name:
+        return UNKNOWN_FILE_KEY
+    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
+    return np.uint64(int.from_bytes(digest, "big"))
+
+
+def make_file_df(f) -> pd.DataFrame:
+    """One row identifying the flatcaf this ntuple was built from.
+
+    Indexed on ``entry`` like ``make_histpotdf``, the other per-file table, so
+    the loader's ``__ntuple`` tagging leaves it with the ``(__ntuple, entry)``
+    index every other single-valued table has.
+
+    The name itself is deliberately NOT a column.  PyTables cannot map a Python
+    object column, or a numpy bytes column, to a C type in ``format="fixed"``,
+    which is what ``run_df_maker.run_pool`` writes with -- so it pickles the
+    block, and the pickled node costs ~1.09 MB however few rows it holds.
+    Measured against a 1.055 MB ``dfs/kex`` product: +23 kB for the key alone,
+    +30 kB with ``n_entry``, +1089 kB with the name, i.e. the name would roughly
+    double the product.  ``file_key`` is a pure function of the basename, so the
+    names come back by hashing the input list, which is version-controlled in
+    ``lists/``.  If a name ever fails to resolve, the key simply misses, which is
+    visible rather than wrong.
+
+    ``n_entry`` is the one fact here that becomes unrecoverable once a flatcaf is
+    deleted from dCache, and it is what makes a partial read detectable; it costs
+    ~7 kB per product.  Drop it if that is not worth it.
+
+    Never returns None: ``run_pool`` zips ``NAMES`` against the maker results in
+    reverse, and a None return is dropped from that list rather than held as a
+    gap, which would silently shift every table's name.
+    """
+    name = ""
+    path = getattr(f, "file_path", None)
+    if path:
+        # Verbatim, not normalised. In grid mode -- how the production runs --
+        # run_grid xrdcp's each file into the job's cwd and passes bare
+        # basenames, so file_path IS the basename; in pool mode it is an xroot
+        # URL or a /pnfs path, and basename handles both. Two loader paths do
+        # rename the file first (the streaming-timeout failover to
+        # {uuid4()}_{basename}, and PREPROCESS to temp{i}_{uuid4()}...), but
+        # failover needs a network read, which grid mode does not do, and no
+        # kaon config sets PREPROCESS.
+        name = os.path.basename(str(path))
+
+    n_entry = UNKNOWN_N_ENTRY
+    try:
+        if f is not None and "recTree" in f:
+            n_entry = int(f["recTree"].num_entries)
+    except Exception:
+        pass
+
+    df = pd.DataFrame(
+        {
+            "file_key": pd.Series([file_key(name)], dtype="uint64"),
+            "n_entry": pd.Series([n_entry], dtype="int64"),
+        }
+    )
+    df.index.name = "entry"
+    return df
 
 
 def make_slice_df(f: dict) -> pd.DataFrame:
