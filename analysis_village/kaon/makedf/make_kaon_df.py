@@ -10,6 +10,8 @@ import pandas as pd
 from makedf import chi2pid
 from makedf.makedf import make_mchdrdf, make_trkhitdf
 
+from . import range_momentum
+
 KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
 TRUE_KE_CUT = 0.
@@ -779,6 +781,16 @@ def _extract_base_track_df(f: dict):
         'rec.slc.reco.pfp.trk.chi2pid.0.chi2_pion',
         'rec.slc.reco.pfp.trk.chi2pid.1.chi2_pion',
         'rec.slc.reco.pfp.trk.chi2pid.2.chi2_pion',
+        # Range-momentum under the pion hypothesis. Not used by any selection --
+        # it is the closure reference for trk_rangeP_kaon, which we compute
+        # ourselves because caf::SRTrkRange has no kaon slot. sbncode builds
+        # p_pion by mass-scaling the muon CSDA table (RangePAllPID_module.cc:
+        # 89-95), which is exactly the transformation range_momentum.p_kaon
+        # applies with m_K, so reproducing this column from trk_len is what
+        # demonstrates the kaon column is what a patched sbncode would write.
+        # Drop this line and the col_map entry if the extra float is not wanted;
+        # nothing downstream reads it.
+        'rec.slc.reco.pfp.trk.rangeP.p_pion',
         # Backtracked truth of the track's best-matched true particle. Needed
         # to say what a selected pair actually was -- chi2 PID answers what it
         # looks like, which is a different question and the only one the
@@ -889,6 +901,7 @@ def _extract_base_track_df(f: dict):
         _key("pfp", "trk", "chi2pid", "I0", "chi2_pion"): "chi2_pion_I0",
         _key("pfp", "trk", "chi2pid", "I1", "chi2_pion"): "chi2_pion_I1",
         _key("pfp", "trk", "chi2pid", "I2", "chi2_pion"): "chi2_pion_I2",
+        _key("pfp", "trk", "rangeP", "p_pion"): "trk_rangeP_pion",
         _key("pfp", "trk", "truth", "p", "pdg"): "truth_pdg",
         _key("pfp", "trk", "truth", "p", "G4ID"): "truth_G4ID",
         _key("pfp", "trk", "truth", "p", "parent"): "truth_parent",
@@ -942,6 +955,17 @@ def _extract_base_track_df(f: dict):
                         ("truth_interaction_id", -1)):
         if _col in clean_df.columns:
             clean_df[_col] = clean_df[_col].replace(_unmatched, _fill).astype(int)
+
+    # Range-momentum under the KAON hypothesis, which the CAF does not carry:
+    # caf::SRTrkRange has p_muon/p_pion/p_proton and no kaon slot, and adding one
+    # upstream would mean a coordinated sbnobj/sbnanaobj schema change plus a
+    # full reco reprocessing. It is unnecessary -- sbncode's own producer takes
+    # exactly one track-dependent input, recob::Track::Length(), which is trk_len
+    # here. See makedf/range_momentum.py for the derivation and the fidelity
+    # notes; NaN below ~3.29 cm, where the muon CSDA spline would be
+    # extrapolated off the bottom of its table.
+    if "trk_len" in clean_df.columns:
+        clean_df["trk_rangeP_kaon"] = range_momentum.p_kaon(clean_df["trk_len"].to_numpy(float))
 
     # Restore index: entry and slice index are already in the index, so just append pfp_index
     clean_df = clean_df.set_index("pfp_index", append=True).sort_index()
