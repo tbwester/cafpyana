@@ -70,6 +70,34 @@ def _open_with_retries(path, attempts=3, sleep=5.0):
     # so _loaddf can trigger the local copy failover.
     raise last_exc
 
+def _file_level_dfs(f, applyfs, index):
+    """Run data frame making when there is no usable recTree.
+
+    A file with no recTree, or no events, still consumed an __ntuple label: the
+    label is the file's position in the job's input list and is assigned before
+    anything is read. If a makedf routine needs to keep track of the input
+    list, it can specify ``runs_without_rectree = True``. Everything else is
+    skipped as usual if there is no recTree
+    """
+    optin = [i for i, g in enumerate(applyfs) if getattr(g, "runs_without_rectree", False)]
+    if optin and optin != list(range(len(applyfs) - len(optin), len(applyfs))):
+        raise ValueError(
+            "DF maker with runs_without_rectree set but does not align "
+            f"at positions {optin} of {len(applyfs)}."
+        )
+
+    results = []
+    for i in optin:
+        df = applyfs[i](f)
+        if df is None:
+            continue
+        df = df.copy(deep=True)
+        df["__ntuple"] = index
+        df.set_index("__ntuple", append=True, inplace=True)
+        new_order = [df.index.nlevels - 1] + list(range(df.index.nlevels - 1))
+        results.append(df.reorder_levels(new_order))
+    return results
+
 def _execute_load(f, applyfs, index, fname):
     """Internal helper to process an open file handle."""
     results = []
@@ -80,8 +108,10 @@ def _execute_load(f, applyfs, index, fname):
     # --- PHASE A: Main Trees ---
     if "recTree" not in f:
         print(f"File ({fname}) missing recTree. Skipping main DFS.", flush=True)
+        results += _file_level_dfs(f, applyfs, index)
     elif totevt < 1e-6:
         print(f"File ({fname}) has 0 in TotalEvents. Skipping main DFS.", flush=True)
+        results += _file_level_dfs(f, applyfs, index)
     else:
         for i, applyf in enumerate(applyfs):
             df = applyf(f)
