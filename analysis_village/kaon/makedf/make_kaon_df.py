@@ -590,10 +590,15 @@ def make_true_type_df(f) -> pd.DataFrame:
 # renumbers from zero, so recovering it needs ngrid, the list, and which files
 # failed, none of which the product carries.
 #
-# A maker rather than a loader change: _execute_load calls every entry in a
-# config's DFS with the open uproot file, and uproot's ReadOnlyDirectory carries
-# file_path, so the file's own name is reachable from in here and
-# pyanalib/ntuple_glob.py does not have to be touched.
+# Almost a maker rather than a loader change: _execute_load hands each entry in a
+# config's DFS the open uproot file, and uproot's ReadOnlyDirectory carries
+# file_path, so the file's own name is reachable from in here.
+#
+# One loader line is needed, though, and the first version of this patch was wrong
+# to claim otherwise. _execute_load does not call every maker on every file: one
+# with no recTree, or TotalEvents == 0, skips the whole DFS list, so make_file_df
+# never ran on it and the label it consumed got no row -- 621 of 14,821 flatcafs
+# (4.2%) on the first patched production. See loader_all_files.patch.
 
 #: ``file_key`` for a file whose name could not be determined.  A real name
 #: collides with this with probability 2**-64.
@@ -643,9 +648,19 @@ def make_file_df(f) -> pd.DataFrame:
     deleted from dCache, and it is what makes a partial read detectable; it costs
     ~7 kB per product.  Drop it if that is not worth it.
 
+    Runs on every input file, including one with no recTree or no events, via the
+    ``runs_without_rectree`` flag set below.  ``n_entry`` then separates the cases:
+    ``-1`` no recTree, ``0`` a recTree holding nothing, ``N`` a normal file -- so an
+    absence from the export means "the loader never got this file" rather than
+    pooling that with "the file was empty".
+
     Never returns None: ``run_pool`` zips ``NAMES`` against the maker results in
     reverse, and a None return is dropped from that list rather than held as a
     gap, which would silently shift every table's name.
+
+    Must stay LAST in the config's DFS.  The reverse zip means the makers that run
+    without a recTree have to be a suffix of DFS for the names to line up;
+    _file_level_dfs raises if they are not.
     """
     name = ""
     path = getattr(f, "file_path", None)
@@ -675,6 +690,12 @@ def make_file_df(f) -> pd.DataFrame:
     )
     df.index.name = "entry"
     return df
+
+
+#: Run this maker even when the file has no usable recTree -- see _file_level_dfs
+#: in pyanalib/ntuple_glob.py.  It is the only maker here that does not read
+#: recTree, and the only one whose value is in existing for files that hold nothing.
+make_file_df.runs_without_rectree = True
 
 
 def make_slice_df(f: dict) -> pd.DataFrame:
@@ -863,9 +884,34 @@ def _extract_base_track_df(f: dict):
         trkhitdf = make_trkhitdf(f, plane)
         trkhitdf = trkhitdf[InFV_SBND(df=trkhitdf)]
 
+        # "cv" is NOT skipped, and that is the point of this loop covering nine
+        # entries rather than eight.  The eight varied chi2 are recomputed here
+        # from hits, under this module's hit selection -- the InFV filter above
+        # and chi2pid.chi2's rr < 26 / ~firsthit / ~lasthit cuts.  The nominal
+        # chi2 they used to be compared against is not: it is read off the CAF,
+        # where LArSoft computed it with its own hit selection at reco time.  So
+        # the ratio nominal -> varied mixed a calorimetry effect with a
+        # hit-selection difference, and the two are not separable after the fact.
+        #
+        # Running cv through this same path gives the variations a like-for-like
+        # denominator.  It also equalises the missing values: a track whose hits
+        # are all cut leaves the groupby in chi2pid.chi2 with no group and comes
+        # back NaN, and it now does so for cv exactly as for the eight, so the
+        # ratio is defined wherever it exists at all.  Against the CAF nominal it
+        # was not -- 27.8% of tracks with all 12 nominal chi2 finite had NaN in
+        # every varied column, rising to 60.6% for tracks not contained in the FV,
+        # because the chi2 sum uses only the last 26 cm of a track and the InFV
+        # filter deletes exactly those hits for a track that leaves the volume.
+        #
+        # It does NOT make cv equal to the CAF nominal, and is not meant to.  The
+        # difference between chi2_{par}_I{plane}_cv and chi2_{par}_I{plane} is the
+        # measurement of how far this module's calorimetry chain sits from
+        # LArSoft's -- hit selection, calibration constants and template
+        # interpolation together.  That comparison is the reason to keep both.
+        #
+        # Costs one extra dE/dx recomputation per plane, i.e. 9/8 of the previous
+        # work in this loop, and 12 columns on the track table.
         for var_name, calo_params in chi2pid.CALO_VARIATIONS.items():
-            if var_name == "cv":
-                continue
             # Calculate new dE/dx
             dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params)
             trkhitdf["dedx_redo"] = dedx_redo
@@ -917,9 +963,9 @@ def _extract_base_track_df(f: dict):
     }
 
     # Add systematic columns to col_map
+    # Includes "cv", matching the loop above.  chi2_{par}_I{plane}_cv does not
+    # collide with the CAF's chi2_{par}_I{plane}: both are kept, deliberately.
     for var_name in chi2pid.CALO_VARIATIONS.keys():
-        if var_name == "cv":
-            continue
         for plane in [0, 1, 2]:
             col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
             col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
