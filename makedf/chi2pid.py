@@ -85,7 +85,13 @@ def chi2_ndof(hitdf):
 
     return chi2_group.size()
 
-def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
+def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
+    """charge selects where SBND's dQ/dx comes from.
+
+    "integral"  rebuild it as integral/pitch and apply the yz map (the default,
+                and what every caller did before this argument existed)
+    "dqdx"      take the calorimetry's own dQ/dx off the CAF, yz already in it
+    """
     if calibrate == "ICARUS": 
         # get raw dqdx
         dqdx = dqdxdf.integral / dqdxdf.pitch
@@ -125,8 +131,19 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
         dqdx = dqdx * tpc_scale * np.exp(tdrift / etau) / yz_scale
     elif calibrate == "SBND": # TODO: add calibrations?
-        # get raw dqdx
-        dqdx  = dqdxdf.integral / dqdxdf.pitch
+        if charge == "dqdx":
+            # The CAF's dqdx branch is the calorimetry's own dQ/dx, and it is not
+            # integral/pitch: GnocchiCalorimetry runs with ChargeMethod 3, which
+            # sums the hit integrals over the snippet, and the CAF stores only
+            # the primary hit's integral -- so the sum cannot be rebuilt from the
+            # file.  NormalizeYZ has also already been applied to it.  Take it as
+            # given and skip the yz lookup rather than correcting twice.  The
+            # lifetime correction below still applies: LArSoft does that inside
+            # dEdx_AREA, after dQ/dx is written.
+            dqdx = dqdxdf.dqdx
+        else:
+            # get raw dqdx
+            dqdx  = dqdxdf.integral / dqdxdf.pitch
 
         this_yz_cal_df = SBND_yz_cal_mc_df   if isMC else SBND_yz_cal_data_df
         this_yz_zbin = yz_zbin_sbnd_mc if isMC else yz_zbin_sbnd_data
@@ -146,12 +163,15 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
         itpc = dqdxdf.tpc
         plane = dqdxdf.plane
 
-        yzdf = pd.DataFrame({"ybin": ybin, "zbin": zbin, "itpc": itpc, "plane": plane, "iov": iov})
-        yzdf['iov'] = 0 ## yzdf iov ==0 for MC and data
-        yz_scale = yzdf.merge(this_yz_cal_df, on=["iov", "itpc", "plane", "ybin", "zbin"], how="left", validate="many_to_one").scale
-        yz_scale[yz_scale < 1e-3] = 1.
-        yz_scale = yz_scale.fillna(1)
-        yz_scale.index = dqdxdf.index
+        if charge == "dqdx":
+            yz_scale = pd.Series(1., index=dqdxdf.index)
+        else:
+            yzdf = pd.DataFrame({"ybin": ybin, "zbin": zbin, "itpc": itpc, "plane": plane, "iov": iov})
+            yzdf['iov'] = 0 ## yzdf iov ==0 for MC and data
+            yz_scale = yzdf.merge(this_yz_cal_df, on=["iov", "itpc", "plane", "ybin", "zbin"], how="left", validate="many_to_one").scale
+            yz_scale[yz_scale < 1e-3] = 1.
+            yz_scale = yz_scale.fillna(1)
+            yz_scale.index = dqdxdf.index
         #dqdxdf['yz_scale'] = yz_scale ## FIXME
 
         #yzdf['rr'] = dqdxdf.rr
@@ -199,8 +219,8 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
     return dqdx*gain_perhit
 
-def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None):
-    dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC)
+def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral"):
+    dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC, charge=charge)
     if gain == "SBND":
 
         if new_calo_params is None:
