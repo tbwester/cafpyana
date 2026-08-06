@@ -882,38 +882,51 @@ def _extract_base_track_df(f: dict):
     for plane in [0, 1, 2]:
         # Load track hits for this plane
         trkhitdf = make_trkhitdf(f, plane)
-        trkhitdf = trkhitdf[InFV_SBND(df=trkhitdf)]
 
+        # The hits are NOT FV-filtered here.  That filter used to run on this
+        # line, and it was the last thing holding the recomputed chi2 away from
+        # the CAF's: LArSoft applies no such cut, so filtering first guaranteed a
+        # different hit set.  It was also the wrong object to cut on -- the FV
+        # box is a 10 cm fiducial inset for choosing tracks, not a hit-quality
+        # mask, and every hit it removed is a good hit inside the active volume.
+        #
+        # Two things it actively broke.  firsthit/lasthit are set in
+        # make_trkhitdf from the unfiltered hit ordering, so deleting the hit
+        # carrying lasthit left no survivor carrying it: ~lasthit then excluded
+        # nothing and the new boundary hit, precisely the one LArSoft threw out,
+        # was kept.  That fired on 76.4% of uncontained tracks.  And for a track
+        # leaving the volume the cut deletes exactly the last 26 cm the chi2 sum
+        # is built from, so 60.6% of those came back NaN in every varied column.
+        # Dropping it gives 43.7% more tracks a defined chi2.
+        #
+        # Containment is still a selection.  It is applied downstream on the
+        # track's start and end, which is where it belongs and is unaffected.
+        #
         # "cv" is NOT skipped, and that is the point of this loop covering nine
         # entries rather than eight.  The eight varied chi2 are recomputed here
-        # from hits, under this module's hit selection -- the InFV filter above
-        # and chi2pid.chi2's rr < 26 / ~firsthit / ~lasthit cuts.  The nominal
-        # chi2 they used to be compared against is not: it is read off the CAF,
-        # where LArSoft computed it with its own hit selection at reco time.  So
-        # the ratio nominal -> varied mixed a calorimetry effect with a
-        # hit-selection difference, and the two are not separable after the fact.
+        # from hits, under chi2pid.chi2's rr < 26 / ~firsthit / ~lasthit cuts.
+        # The nominal chi2 they used to be compared against is not: it is read
+        # off the CAF, where LArSoft computed it at reco time.  So the ratio
+        # nominal -> varied mixed a calorimetry effect with a hit-selection
+        # difference, and the two are not separable after the fact.  Running cv
+        # through this same path gives the variations a like-for-like
+        # denominator.
         #
-        # Running cv through this same path gives the variations a like-for-like
-        # denominator.  It also equalises the missing values: a track whose hits
-        # are all cut leaves the groupby in chi2pid.chi2 with no group and comes
-        # back NaN, and it now does so for cv exactly as for the eight, so the
-        # ratio is defined wherever it exists at all.  Against the CAF nominal it
-        # was not -- 27.8% of tracks with all 12 nominal chi2 finite had NaN in
-        # every varied column, rising to 60.6% for tracks not contained in the FV,
-        # because the chi2 sum uses only the last 26 cm of a track and the InFV
-        # filter deletes exactly those hits for a track that leaves the volume.
-        #
-        # It does NOT make cv equal to the CAF nominal, and is not meant to.  The
-        # difference between chi2_{par}_I{plane}_cv and chi2_{par}_I{plane} is the
-        # measurement of how far this module's calorimetry chain sits from
-        # LArSoft's -- hit selection, calibration constants and template
-        # interpolation together.  That comparison is the reason to keep both.
+        # With the hit sets now identical and the constants matched, cv also
+        # equals the CAF nominal to float precision on every track
+        # (notebook_chi2pid C13).  chi2_{par}_I{plane} and its _cv are then the
+        # same number computed twice, once by LArSoft and once here, and that is
+        # the reason to keep both: any divergence is a regression in this chain
+        # and can be nothing else.
         #
         # Costs one extra dE/dx recomputation per plane, i.e. 9/8 of the previous
         # work in this loop, and 12 columns on the track table.
         for var_name, calo_params in chi2pid.CALO_VARIATIONS.items():
-            # Calculate new dE/dx
-            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params)
+            # charge="dqdx" reads the calorimetry's own dQ/dx off the CAF.
+            # Rebuilding it as integral/pitch cannot reproduce it: Gnocchi runs
+            # with ChargeMethod 3 and sums the integrals over the hit's snippet,
+            # and only the primary hit's integral is in the file.
+            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params, charge="dqdx")
             trkhitdf["dedx_redo"] = dedx_redo
 
             # Recalculate Chi2 for Muon, Proton, Kaon and Pion
