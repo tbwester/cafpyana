@@ -6,7 +6,7 @@ import uproot
 
 larsoft_data_v = "v1_02_02"
 icarus_data_v = "v10_06_06"
-sbnd_data_v = "v1_42_00" # the version sbndcode v10_14_02 reco2 read
+sbnd_data_v = "v01_42_00" # the version sbndcode v10_14_02 reco2 read
 
 rr_max_cut_chi2 = 26. ## for resolving MC's hit RR cut, after fixing the issue, put this value to 26.
 
