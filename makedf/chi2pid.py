@@ -6,7 +6,7 @@ import uproot
 
 larsoft_data_v = "v1_02_02"
 icarus_data_v = "v10_06_06"
-sbnd_data_v = "v01_41_00" #3 for sbndcode v10_14_02
+sbnd_data_v = "v1_42_00" # the version sbndcode v10_14_02 reco2 read
 
 rr_max_cut_chi2 = 26. ## for resolving MC's hit RR cut, after fixing the issue, put this value to 26.
 
@@ -26,7 +26,9 @@ SBND_CALO_PARAMS = {
     "beta_90": [0.204, 0.1835451204193374],
     "R_emb": [1.25, 1.567685536351266],
     "gains": [
-        [0.0203521, 0.0202351, 0.0200727], ## MC
+        ## MC: sbndcode calorimetry_sbnd.fcl, sbnd_calorimetryalgmc.CalAreaConstants
+        [0.02052, 0.02044, 0.02019], ## MC
+        ## Data would be [0.02172, 0.02150, 0.02103] by the same fcl
         [0.02, 0.02, 0.02]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
@@ -107,7 +109,12 @@ def chi2_ndof(hitdf):
 
     return chi2_group.size()
 
-def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
+def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
+    """charge selects where SBND's dQ/dx comes from.
+
+    "integral"  rebuild it as integral/pitch and apply the yz map (the default)
+    "dqdx"      take the calorimetry's own dQ/dx off the CAF, yz already in it
+    """
     if calibrate == "ICARUS": 
         # get raw dqdx
         dqdx = dqdxdf.integral / dqdxdf.pitch
@@ -147,8 +154,16 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
         dqdx = dqdx * tpc_scale * np.exp(tdrift / etau) / yz_scale
     elif calibrate == "SBND": # TODO: add calibrations?
-        # get raw dqdx
-        dqdx  = dqdxdf.integral / dqdxdf.pitch
+        if charge == "dqdx":
+            # The CAF's dqdx branch is the calorimetry's own dQ/dx, but it is
+            # not integral/pitch: GnocchiCalorimetry runs with ChargeMethod 3,
+            # which sums the hit integrals while the CAF stores only the
+            # primary hit's integral, so the sum cannot be rebuilt from the
+            # file.  NormalizeYZ has also already been applied to it.
+            dqdx = dqdxdf.dqdx
+        else:
+            # get raw dqdx
+            dqdx  = dqdxdf.integral / dqdxdf.pitch
 
         this_yz_cal_df = SBND_yz_cal_mc_df   if isMC else SBND_yz_cal_data_df
         this_yz_zbin = yz_zbin_sbnd_mc if isMC else yz_zbin_sbnd_data
@@ -168,12 +183,15 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
         itpc = dqdxdf.tpc
         plane = dqdxdf.plane
 
-        yzdf = pd.DataFrame({"ybin": ybin, "zbin": zbin, "itpc": itpc, "plane": plane, "iov": iov})
-        yzdf['iov'] = 0 ## yzdf iov ==0 for MC and data
-        yz_scale = yzdf.merge(this_yz_cal_df, on=["iov", "itpc", "plane", "ybin", "zbin"], how="left", validate="many_to_one").scale
-        yz_scale[yz_scale < 1e-3] = 1.
-        yz_scale = yz_scale.fillna(1)
-        yz_scale.index = dqdxdf.index
+        if charge == "dqdx":
+            yz_scale = pd.Series(1., index=dqdxdf.index)
+        else:
+            yzdf = pd.DataFrame({"ybin": ybin, "zbin": zbin, "itpc": itpc, "plane": plane, "iov": iov})
+            yzdf['iov'] = 0 ## yzdf iov ==0 for MC and data
+            yz_scale = yzdf.merge(this_yz_cal_df, on=["iov", "itpc", "plane", "ybin", "zbin"], how="left", validate="many_to_one").scale
+            yz_scale[yz_scale < 1e-3] = 1.
+            yz_scale = yz_scale.fillna(1)
+            yz_scale.index = dqdxdf.index
         #dqdxdf['yz_scale'] = yz_scale ## FIXME
 
         #yzdf['rr'] = dqdxdf.rr
@@ -195,7 +213,9 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
         # apply the corrections
         t0 = 0 # assume in time
-        tdrift = dqdxdf.t / 2000. - 0.2
+        # 0.205 ms, see detectorclocks_sbnd.fcl TriggerOffsetTPC = -0.205e3 us,
+        # which is what trigger_offset() returns in CalorimetryAlg::LifetimeCorrection
+        tdrift = dqdxdf.t / 2000. - 0.205
         etau_corr = np.exp(tdrift / etau)
         #dqdxdf['etau_corr'] = etau_corr ## FIXME
         dqdx = dqdx * etau_corr * yz_scale
@@ -219,8 +239,8 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
     return dqdx*gain_perhit
 
-def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None):
-    dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC)
+def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral"):
+    dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC, charge=charge)
     if gain == "SBND":
 
         if new_calo_params is None:
@@ -436,8 +456,10 @@ conn.close()
 ##############################
 
 # load SBND YZ unif maps
-SBND_yz_cal_mc_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_correction_map_mcp2025b5e18.root"
-SBND_yz_cal_data_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_correction_map_data1e20.root"
+# the maps normtools_sbnd.fcl points NormalizeYZ at, so the correction cafpyana
+# applies to integral/pitch is the one the reco applied to the same hits
+SBND_yz_cal_mc_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_mc2025_v10_14_02.root"
+SBND_yz_cal_data_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_data2025_v10_14_02.root"
 
 yz_zbin_sbnd_mc = []
 yz_ybin_sbnd_mc = []
