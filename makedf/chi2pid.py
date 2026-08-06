@@ -28,8 +28,7 @@ SBND_CALO_PARAMS = {
     "gains": [
         ## MC: sbndcode calorimetry_sbnd.fcl, sbnd_calorimetryalgmc.CalAreaConstants
         [0.02052, 0.02044, 0.02019], ## MC
-        ## Data would be [0.02172, 0.02150, 0.02103] by the same fcl; left alone
-        ## here because nothing in this patch was validated against data.
+        ## Data would be [0.02172, 0.02150, 0.02103] by the same fcl
         [0.02, 0.02, 0.02]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
@@ -88,8 +87,7 @@ def chi2_ndof(hitdf):
 def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
     """charge selects where SBND's dQ/dx comes from.
 
-    "integral"  rebuild it as integral/pitch and apply the yz map (the default,
-                and what every caller did before this argument existed)
+    "integral"  rebuild it as integral/pitch and apply the yz map (the default)
     "dqdx"      take the calorimetry's own dQ/dx off the CAF, yz already in it
     """
     if calibrate == "ICARUS": 
@@ -132,14 +130,11 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
         dqdx = dqdx * tpc_scale * np.exp(tdrift / etau) / yz_scale
     elif calibrate == "SBND": # TODO: add calibrations?
         if charge == "dqdx":
-            # The CAF's dqdx branch is the calorimetry's own dQ/dx, and it is not
-            # integral/pitch: GnocchiCalorimetry runs with ChargeMethod 3, which
-            # sums the hit integrals over the snippet, and the CAF stores only
-            # the primary hit's integral -- so the sum cannot be rebuilt from the
-            # file.  NormalizeYZ has also already been applied to it.  Take it as
-            # given and skip the yz lookup rather than correcting twice.  The
-            # lifetime correction below still applies: LArSoft does that inside
-            # dEdx_AREA, after dQ/dx is written.
+            # The CAF's dqdx branch is the calorimetry's own dQ/dx, but it is
+            # not integral/pitch: GnocchiCalorimetry runs with ChargeMethod 3,
+            # which sums the hit integrals while the CAF stores only the
+            # primary hit's integral, so the sum cannot be rebuilt from the
+            # file.  NormalizeYZ has also already been applied to it.
             dqdx = dqdxdf.dqdx
         else:
             # get raw dqdx
@@ -193,7 +188,7 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
 
         # apply the corrections
         t0 = 0 # assume in time
-        # 0.205 ms, not 0.2: detectorclocks_sbnd.fcl TriggerOffsetTPC = -0.205e3 us,
+        # 0.205 ms, see detectorclocks_sbnd.fcl TriggerOffsetTPC = -0.205e3 us,
         # which is what trigger_offset() returns in CalorimetryAlg::LifetimeCorrection
         tdrift = dqdxdf.t / 2000. - 0.205
         etau_corr = np.exp(tdrift / etau)
