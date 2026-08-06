@@ -6,7 +6,7 @@ import uproot
 
 larsoft_data_v = "v1_02_02"
 icarus_data_v = "v10_06_06"
-sbnd_data_v = "v01_41_00" #3 for sbndcode v10_14_02
+sbnd_data_v = "v1_42_00" # the version sbndcode v10_14_02 reco2 read
 
 rr_max_cut_chi2 = 26. ## for resolving MC's hit RR cut, after fixing the issue, put this value to 26.
 
@@ -26,7 +26,10 @@ SBND_CALO_PARAMS = {
     "beta_90": [0.204, 0.1835451204193374],
     "R_emb": [1.25, 1.567685536351266],
     "gains": [
-        [0.0203521, 0.0202351, 0.0200727], ## MC
+        ## MC: sbndcode calorimetry_sbnd.fcl, sbnd_calorimetryalgmc.CalAreaConstants
+        [0.02052, 0.02044, 0.02019], ## MC
+        ## Data would be [0.02172, 0.02150, 0.02103] by the same fcl; left alone
+        ## here because nothing in this patch was validated against data.
         [0.02, 0.02, 0.02]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
@@ -170,7 +173,9 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False):
 
         # apply the corrections
         t0 = 0 # assume in time
-        tdrift = dqdxdf.t / 2000. - 0.2
+        # 0.205 ms, not 0.2: detectorclocks_sbnd.fcl TriggerOffsetTPC = -0.205e3 us,
+        # which is what trigger_offset() returns in CalorimetryAlg::LifetimeCorrection
+        tdrift = dqdxdf.t / 2000. - 0.205
         etau_corr = np.exp(tdrift / etau)
         #dqdxdf['etau_corr'] = etau_corr ## FIXME
         dqdx = dqdx * etau_corr * yz_scale
@@ -391,8 +396,10 @@ conn.close()
 ##############################
 
 # load SBND YZ unif maps
-SBND_yz_cal_mc_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_correction_map_mcp2025b5e18.root"
-SBND_yz_cal_data_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_correction_map_data1e20.root"
+# the maps normtools_sbnd.fcl points NormalizeYZ at, so the correction cafpyana
+# applies to integral/pitch is the one the reco applied to the same hits
+SBND_yz_cal_mc_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_mc2025_v10_14_02.root"
+SBND_yz_cal_data_f = "/cvmfs/sbnd.opensciencegrid.org/products/sbnd/sbnd_data/" + sbnd_data_v + "/YZmaps/yz_data2025_v10_14_02.root"
 
 yz_zbin_sbnd_mc = []
 yz_ybin_sbnd_mc = []
