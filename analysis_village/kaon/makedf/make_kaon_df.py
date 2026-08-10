@@ -712,49 +712,62 @@ def make_slice_df(f: dict) -> pd.DataFrame:
 
     return slc_df
 
+#: Multisim universes kept per knob.  Already low -- 49 multisim knobs at 100
+#: universes are 4,900 of the table's 5,465 columns, and a multisim covariance
+#: converges as 1/sqrt(N), so going below this trades a real input for bytes.
+MULTISIM_NUNIV = 100
+
+
 def make_syst_df(f: dict) -> pd.DataFrame:
+    """Reweight systematics, **one row per true interaction**.
+
+    Indexed ``(entry, rec.mc.nu..index)`` -- the same leading levels as
+    ``make_true_type_df`` -- so it joins to truth directly and needs nothing from
+    reconstruction.
+
+    Why per interaction, and not per slice
+    --------------------------------------
+    A reweight is a property of the interaction: GENIE and flux weights are
+    functions of the true final state and the parent hadron, and no part of
+    reconstruction enters them.  The previous version mapped them onto slices
+    through ``rec.slc.tmatch.index``, which had three costs:
+
+    * **Duplication.**  Two slices matching one interaction stored two identical
+      copies of 5,465 floats, and the count scales with the slice gate rather
+      than with the physics.
+    * **Coupling.**  The table could not be produced without the reco matching,
+      so it had to be rebuilt whenever reconstruction changed even though not one
+      weight moved.  Kept separate, it is written once and reused across every
+      reprocessing.
+    * **A decision taken silently.**  Unmatched slices were reindexed to weight
+      **1.0**, which asserts "nominal" for an object that has no interaction
+      behind it at all.  With low matching efficiency that is a physics choice
+      buried in a df maker.  Per interaction there is nothing to assert: a slice
+      that matched nothing simply has no partner, and how to treat it belongs to
+      the analysis, where it can be counted.
+
+    Consumers join on the interaction, which is what
+    ``kaonana.analysis.selection.attach_true_type`` already does for
+    ``true_type``.
     """
-    Extracts systematic weights only for slices that pass basic pre-cuts.
-    This saves massive amounts of memory compared to saving weights for all slices.
-    """
-    branches_to_load = [
-        'rec.slc.is_clear_cosmic',
-        'rec.slc.tmatch.index'
-    ]
-
-    # Load slice branches
-    slc_df = ph.loadbranches(f["recTree"], branches_to_load).rec.slc
-    if isinstance(slc_df.columns, pd.MultiIndex):
-        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
-
-    # PRE-CUT 1: Only keep slices that are not clear cosmics
-    slc_df = slc_df[slc_df.is_clear_cosmic == 0]
-
-    # Get systematic weights, limiting multisims to 100 universes
-    systs = getsyst.get_all_syst_df(f, multisim_nuniv=100)
+    systs = getsyst.get_all_syst_df(f, multisim_nuniv=MULTISIM_NUNIV)
 
     if systs is None or systs.empty:
-        return pd.DataFrame(index=slc_df.index)
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays(
+                [[], []], names=["entry", "rec.mc.nu..index"]
+            )
+        )
 
     # Flatten MultiIndex columns of systs if they are tuples
     if isinstance(systs.columns, pd.MultiIndex):
         systs.columns = ["_".join([str(c) for c in col if c]).strip() for col in systs.columns.values]
 
-    # Drop any slices that didn't match to a true neutrino to get the matching indices
-    valid_matches = slc_df['tmatch_idx'].dropna().astype(int)
+    # get_all_syst_df indexes (entry, inu); rename to the products' MC convention
+    # so the table lines up with true_type and true_kaon without a translation.
+    systs.index.names = ["entry", "rec.mc.nu..index"]
 
-    # Use cafpyana's highly optimized reindexing function to pull the weights
-    if not valid_matches.empty:
-        syst_df = getsyst.filter_systs_nuind(f, systs, valid_matches)
-    else:
-        # Create an empty dataframe with correct columns if no valid matches
-        syst_df = pd.DataFrame(columns=systs.columns, index=valid_matches.index)
-
-    # Slices without a valid truth match (NaN tmatch_idx) were ignored by the filter.
-    # We reindex to include them and fill their weights with 1.0 (nominal).
-    syst_df = syst_df.reindex(slc_df.index, fill_value=1.0)
-
-    return syst_df
+    return systs.sort_index()
 
 def _extract_base_track_df(f: dict):
     """
