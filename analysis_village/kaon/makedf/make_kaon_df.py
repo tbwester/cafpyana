@@ -11,6 +11,7 @@ from makedf import chi2pid
 from makedf.makedf import make_mchdrdf, make_trkhitdf
 
 from . import range_momentum
+from .provenance import UNKNOWN_FILE_KEY, file_key
 
 KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
@@ -600,30 +601,9 @@ def make_true_type_df(f) -> pd.DataFrame:
 # never ran on it and the label it consumed got no row -- 621 of 14,821 flatcafs
 # (4.2%) on the first patched production. See loader_all_files.patch.
 
-#: ``file_key`` for a file whose name could not be determined.  A real name
-#: collides with this with probability 2**-64.
-UNKNOWN_FILE_KEY = np.uint64(0)
-
 #: ``n_entry`` when the count could not be read.  Not 0, which is a legitimate
 #: answer for a file holding no events.
 UNKNOWN_N_ENTRY = -1
-
-
-def file_key(name: str) -> np.uint64:
-    """64-bit key for a flatcaf basename.
-
-    blake2b, NOT the built-in ``hash()``: string hashing is salted per process,
-    so ``hash()`` would give a different key in every worker of the same run.
-
-    Truncated to 64 bits because that is what fits a numpy column and is
-    comfortably enough -- the birthday collision probability is ~2.7e-8 at 1e6
-    files (32 bits would expect ~116 collisions there, and does not).  Over the
-    14,821 names in ``lists/kex_list.txt`` there are none.
-    """
-    if not name:
-        return UNKNOWN_FILE_KEY
-    digest = hashlib.blake2b(name.encode("utf-8"), digest_size=8).digest()
-    return np.uint64(int.from_bytes(digest, "big"))
 
 
 def make_file_df(f) -> pd.DataFrame:
