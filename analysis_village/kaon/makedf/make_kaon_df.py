@@ -533,6 +533,56 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
     return out
 
 
+def k_chain_contained(tpartdf, ktype: str = 'kplus') -> pd.Series:
+    """Is every segment of the interaction's kaon FV-contained, start and end?
+
+    This is the containment ``k_has_daughter`` actually requires. That function
+    walks back along the kaon chain and applies ``InFV_SBND(start) & InFV_SBND(end)``
+    to the MIP (line 93), to the primary kaon when it reaches one (line 132), and
+    to **every intermediate segment on the way** (lines 140-145). A kaon that
+    re-interacts is several G4 tracks, and all of them have to be inside.
+
+    ``make_true_type_df`` used to test something different and looser: the *end
+    point only*, of the first primary kaon, off ``rec.mc.nu.prim``. Two
+    containment definitions for one object, twenty lines apart, neither
+    mentioning the other -- and the looser one decides type 3 against type 4
+    while the stricter one decides type 1 against type 3. An interaction could
+    therefore be "contained" for the 3/4 split and "not contained" for the 1/3
+    one, which is not a distinction anybody intended.
+
+    Segments are grouped by ``resolve_k_origins``' ``KORIGIN_PRIMARY`` class, so
+    a kaon produced later in a shower does not drag the flag down. An interaction
+    holding two vertex kaons ANDs both; that is 0 of 194 flatcafs here and the
+    per-interaction flag has no way to say "one of them" anyway.
+
+    Returns a bool Series indexed by (entry, interaction_id). Interactions with
+    no charged kaon are absent, and the caller reindexes to False.
+    """
+    df = _flat_true_particles(tpartdf)
+    # This kaon's own charge, not K_PDGS_TRACKED. is_k_contained describes the
+    # K+ of the interaction, and an uncontained K- alongside it must not drag the
+    # flag down -- that produced exactly one true_type 1 interaction flagged
+    # "kaon not contained" in an early version, which is the invariant this
+    # function exists to protect.
+    kaons = df[df.pdg == KPDG[ktype]]
+    if kaons.empty:
+        return pd.Series(dtype=bool)
+
+    origins = resolve_k_origins(tpartdf)
+    kaons = kaons.join(origins['origin'], on=['entry', 'G4ID'])
+    kaons = kaons[kaons['origin'] == KORIGIN_PRIMARY]
+    if kaons.empty:
+        return pd.Series(dtype=bool)
+
+    start = kaons[['start.x', 'start.y', 'start.z']].rename(
+        columns=lambda c: c.split('.')[-1])
+    end = kaons[['end.x', 'end.y', 'end.z']].rename(
+        columns=lambda c: c.split('.')[-1])
+    contained = (InFV_SBND(start) & InFV_SBND(end)).fillna(False)
+    return contained.groupby(
+        [kaons['entry'], kaons['interaction_id']]).all()
+
+
 def make_true_type_df(f) -> pd.DataFrame:
     """
     Creates a minimal dataframe with exactly 1 row per true neutrino interaction.
@@ -560,10 +610,11 @@ def make_true_type_df(f) -> pd.DataFrame:
     true_E_kaon = kplus_first['genE']
     true_P_kaon = np.sqrt(np.maximum(0, true_E_kaon**2 - KMASS['kplus']**2)).fillna(0)
 
-    kplus_end = kplus_first['end'].copy()
-    kplus_end.columns = [c[0] for c in kplus_end.columns]
-    is_k_contained = InFV_SBND(kplus_end)
-    is_k_contained = is_k_contained.fillna(False).astype(bool)
+    # The containment k_has_daughter requires -- every segment of the kaon,
+    # start and end -- rather than the end point of the first one. See
+    # k_chain_contained for why the two used to differ and what that cost.
+    is_k_contained = k_chain_contained(_true_particles(f))
+    is_k_contained = is_k_contained.reindex(mcdf.index).fillna(False).astype(bool)
 
     # 3. Daughter association (hierarchy traversal)
     tpartdf = _true_particles(f)
