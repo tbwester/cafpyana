@@ -49,6 +49,25 @@ PRIM_SPECIES = {
 
 InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
 
+# Decay modes, keyed by the sorted multiset of the kaon's *hard* daughter PDGs --
+# its G4 daughters with delta rays and their photons removed. Recorded because
+# true_type cannot express it: a three-body decay belongs in type 3, while a
+# two-body decay whose MIP left the FV is acceptance loss, and today both land
+# there with nothing to tell them apart.
+DECAY_MODE_UNKNOWN = 0
+DECAY_MODES = {
+    (-13, 14): 1,          # Kmu2   K+ -> mu+ nu
+    (-13, 14, 111): 2,     # Kmu3   K+ -> pi0 mu+ nu
+    (111, 211): 3,         # K2pi   K+ -> pi+ pi0
+    (-211, 211, 211): 4,   # K3pi   K+ -> pi+ pi+ pi-
+    (-11, 12, 111): 5,     # Ke3    K+ -> pi0 e+ nu
+    (111, 111, 211): 6,    # K3pi0  K+ -> pi+ pi0 pi0
+}
+
+# Daughters that say nothing about which decay happened. A delta ray off the
+# kaon track is not part of the decay and must not change its label.
+SOFT_DAUGHTER_PDGS = (11, -11, 22)
+
 def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.DataFrame:
     """
     Signal identification using backward hierarchy traversal.
@@ -207,6 +226,7 @@ TPART_BRANCHES = [
     'rec.true_particles.end.y',
     'rec.true_particles.end.z',
     'rec.true_particles.genE',
+    'rec.true_particles.endE',
     'rec.true_particles.genp.x',
     'rec.true_particles.genp.y',
     'rec.true_particles.genp.z',
@@ -373,6 +393,34 @@ def k_origin_counts(tpartdf):
     return counts[cols].astype(int)
 
 
+def k_decay_mode(df: pd.DataFrame, kaons: pd.DataFrame) -> np.ndarray:
+    """DECAY_MODES code per kaon, from the PDGs of its Geant4 daughters.
+
+    The daughters are taken from the *parent links* already in `df` -- the rows
+    whose `parent` is this kaon's `G4ID` -- and not from
+    `rec.true_particles.daughters`. The explicit list would be the more direct
+    source and cannot be used: `loadbranches` refuses it alongside `pdg`
+    ("different vector structures in the CAF"), because it is jagged per particle
+    where every other branch here is one value per particle. The two agree --
+    checked on 113 primary kaons over 60 flatcafs, identical daughter multisets
+    in every case -- so nothing is lost but the directness.
+
+    Delta rays are dropped (SOFT_DAUGHTER_PDGS) before the lookup: how many
+    electrons a kaon knocked off its track is not part of which decay it was.
+    """
+    pdg_of = dict(zip(zip(df['entry'], df['G4ID']), df['pdg']))
+    by_parent = {}
+    for e, p, g in zip(df['entry'], df['parent'], df['pdg']):
+        by_parent.setdefault((e, p), []).append(g)
+
+    out = []
+    for e, g4 in zip(kaons['entry'], kaons['G4ID']):
+        hard = sorted(p for p in by_parent.get((e, g4), ())
+                      if p not in SOFT_DAUGHTER_PDGS)
+        out.append(DECAY_MODES.get(tuple(hard), DECAY_MODE_UNKNOWN))
+    return np.asarray(out, dtype=np.int64)
+
+
 def make_true_kaon_df(f: dict) -> pd.DataFrame:
     """One row per true charged kaon, with its provenance and kinematics.
 
@@ -392,6 +440,13 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
 
     start_process / end_process are raw caf enum codes (see sbnanaobj
     SREnums.h); end_process distinguishes a decay from an inelastic absorption.
+
+    daughter_contained is the FV containment of the MIP named by daughter_pdg,
+    which is the acceptance cut true_type folds in silently. To recover the
+    per-interaction view:
+
+        ttdf.join(kdf.groupby(level=[0, 1, 2]).daughter_contained.any()
+                     .rename("has_contained_mip"))
     """
     tpartdf = _true_particles(f)
     df = _flat_true_particles(tpartdf)
@@ -409,15 +464,44 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
                         right_on=['entry', 'pG4'], how='left').drop(columns='pG4')
     kaons['parent_pdg'] = kaons['parent_pdg'].fillna(0).astype(int)
 
-    # charged-MIP daughter, if any. No containment requirement: the kdf is raw
-    # truth and the analysis applies its own cuts.
-    mips = df[df.pdg.abs().isin((13, 211))][['entry', 'parent', 'pdg']]
+    # charged-MIP daughter, if any. No containment requirement is imposed on
+    # which kaons are kept -- the kdf is raw truth and the analysis applies its
+    # own cuts -- but the daughter's containment is RECORDED, because that is
+    # the cut k_has_daughter applies (require_contained) before it will call a
+    # chain signal. Without it, "the kaon never decayed to a MIP" and "it did,
+    # but the MIP left the FV" both collapse into true_type 3 and cannot be
+    # told apart downstream. On the exclusive-kaon sample the second case is
+    # about two thirds of that category, so the distinction is not marginal:
+    # it separates a real background from a pure acceptance loss.
+    mip_cols = ['entry', 'parent', 'pdg',
+                'start.x', 'start.y', 'start.z', 'end.x', 'end.y', 'end.z']
+    mips = df[df.pdg.abs().isin((13, 211))][mip_cols].copy()
     mips = mips.rename(columns={'pdg': 'daughter_pdg'})
-    first_mip = mips.groupby(['entry', 'parent']).daughter_pdg.first()
-    n_mip = mips.groupby(['entry', 'parent']).size().rename('n_mip_daughters')
+    mip_start = mips[['start.x', 'start.y', 'start.z']].rename(
+        columns=lambda c: c.split('.')[-1])
+    mip_end = mips[['end.x', 'end.y', 'end.z']].rename(
+        columns=lambda c: c.split('.')[-1])
+    mips['daughter_contained'] = (
+        InFV_SBND(mip_start) & InFV_SBND(mip_end)).fillna(False)
+
+    # Both aggregations are 'first' over the same groupby, so daughter_contained
+    # describes the same MIP that daughter_pdg names, not some other daughter.
+    # n_mip_daughters says when that choice was not unique.
+    grouped = mips.groupby(['entry', 'parent'])
+    first_mip = grouped[['daughter_pdg', 'daughter_contained']].first()
+    n_mip = grouped.size().rename('n_mip_daughters')
     kaons = kaons.join(first_mip, on=['entry', 'G4ID']).join(n_mip, on=['entry', 'G4ID'])
     kaons['daughter_pdg'] = kaons['daughter_pdg'].fillna(0).astype(int)
+    kaons['daughter_contained'] = kaons['daughter_contained'].fillna(False).astype(bool)
     kaons['n_mip_daughters'] = kaons['n_mip_daughters'].fillna(0).astype(int)
+
+    kaons['decay_mode'] = k_decay_mode(df, kaons)
+
+    # Kinetic energy at the END of the track. E/KE below are from genE, the
+    # energy at *production*, which does not say whether the kaon stopped -- and
+    # stopping is what makes a Kmu2 muon monochromatic at 258.15 MeV, the
+    # sharpest truth handle in the sample.
+    kaons['ke_end'] = kaons['endE'] - KMASS['kplus']
 
     p = np.sqrt(kaons['genp.x']**2 + kaons['genp.y']**2 + kaons['genp.z']**2)
     kaons['P'] = p
@@ -436,7 +520,8 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
     })
 
     keep = ['pdg', 'G4ID', 'parent', 'parent_pdg', 'origin', 'origin_pdg',
-            'n_reinteractions', 'daughter_pdg', 'n_mip_daughters',
+            'n_reinteractions', 'daughter_pdg', 'daughter_contained',
+            'n_mip_daughters', 'decay_mode', 'ke_end',
             'E', 'KE', 'P', 'px', 'py', 'pz', 'length',
             'start_x', 'start_y', 'start_z', 'end_x', 'end_y', 'end_z',
             'contained', 'is_fv_contained', 'start_process', 'end_process']
