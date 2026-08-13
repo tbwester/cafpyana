@@ -49,11 +49,10 @@ PRIM_SPECIES = {
 
 InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
 
-# Decay modes, keyed by the sorted multiset of the kaon's *hard* daughter PDGs --
-# its G4 daughters with delta rays and their photons removed. Recorded because
-# true_type cannot express it: a three-body decay belongs in type 3, while a
-# two-body decay whose MIP left the FV is acceptance loss, and today both land
-# there with nothing to tell them apart.
+# Decay modes, keyed by the sorted multiset of the PDGs of the kaon's decay
+# products. Recorded because true_type cannot express it: a three-body decay
+# belongs in type 3, while a two-body decay whose MIP left the FV is acceptance
+# loss, and today both land there with nothing to tell them apart.
 DECAY_MODE_UNKNOWN = 0
 DECAY_MODES = {
     (-13, 14): 1,          # Kmu2   K+ -> mu+ nu
@@ -64,9 +63,13 @@ DECAY_MODES = {
     (111, 111, 211): 6,    # K3pi0  K+ -> pi+ pi0 pi0
 }
 
-# Daughters that say nothing about which decay happened. A delta ray off the
-# kaon track is not part of the decay and must not change its label.
-SOFT_DAUGHTER_PDGS = (11, -11, 22)
+# ``rec.true_particles.start_process`` for G4's Decay process. Which daughters
+# belong to the decay is read off this rather than guessed from their PDGs: a
+# delta ray is eIoni (14), an inelastic product is 13 and a recoiling nucleus is
+# 31 or 44, so one comparison separates all three from the decay products. A PDG
+# rule cannot -- the Ke3 positron and a delta ray are both an e+.
+G4_PROCESS_DECAY = 3
+
 
 def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=True) -> pd.DataFrame:
     """
@@ -85,6 +88,13 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     traversal below walks back exactly one generation, and every row in
     `active` sits at the same depth by construction, so a scalar counter is
     sufficient.
+
+    Both the MIP and the `ndaughters_p <= 2` two-body guard are restricted to
+    G4 *decay* products. Counting every daughter instead counts whatever else
+    G4 recorded off the same track, and the recoiling argon nucleus of a decay
+    at rest is enough to push a clean Kmu2 to three daughters and refuse it --
+    4.5% of contained two-body decays over the 194 reference flatcafs, all of
+    which then land in true_type 3.
     """
     nullcols = ['daughter_pdg', 'n_k_interactions']
     nulldf = pd.DataFrame(columns=nullcols, dtype=float)
@@ -95,12 +105,17 @@ def k_has_daughter(tpartdf: pd.DataFrame, ktype: str, require_contained: bool=Tr
     df.columns = ['.'.join(n for n in c if n != '') for c in df.columns]
     df = df.reset_index()
 
-    dtr_counts = df.groupby(['entry', 'parent']).size().rename('ndaughters')
+    decay_products = df[df.start_process == G4_PROCESS_DECAY]
+    dtr_counts = decay_products.groupby(['entry', 'parent']).size().rename('ndaughters')
     df = df.merge(dtr_counts, left_on=['entry', 'G4ID'], right_index=True, how='left')
     df['ndaughters'] = df['ndaughters'].fillna(0)
 
     target_pdgs = [-13, 211] if ktype == 'kplus' else []
-    active = df[df.pdg.isin(target_pdgs)].copy()
+    # The MIP must itself be a decay product. Without this the guard above would
+    # admit a pion knocked out of an inelastic interaction: such a kaon has no
+    # decay daughters at all, so its ndaughters is 0 and `<= 2` passes vacuously.
+    active = df[df.pdg.isin(target_pdgs)
+                & (df.start_process == G4_PROCESS_DECAY)].copy()
     active['daughter_pdg'] = active['pdg']
 
     if active.empty:
@@ -394,7 +409,7 @@ def k_origin_counts(tpartdf):
 
 
 def k_decay_mode(df: pd.DataFrame, kaons: pd.DataFrame) -> np.ndarray:
-    """DECAY_MODES code per kaon, from the PDGs of its Geant4 daughters.
+    """DECAY_MODES code per kaon, from the PDGs of its Geant4 decay products.
 
     The daughters are taken from the *parent links* already in `df` -- the rows
     whose `parent` is this kaon's `G4ID` -- and not from
@@ -405,19 +420,22 @@ def k_decay_mode(df: pd.DataFrame, kaons: pd.DataFrame) -> np.ndarray:
     checked on 113 primary kaons over 60 flatcafs, identical daughter multisets
     in every case -- so nothing is lost but the directness.
 
-    Delta rays are dropped (SOFT_DAUGHTER_PDGS) before the lookup: how many
-    electrons a kaon knocked off its track is not part of which decay it was.
+    A daughter counts iff `start_process` is Decay. Selecting on PDG instead
+    cannot express Ke3: dropping e+ as a delta ray drops the positron that
+    identifies the mode, leaving (12, 111) and no entry to match, so mode 5 is
+    unreachable and its ~5% of decays fall into DECAY_MODE_UNKNOWN alongside the
+    absorptions.
     """
-    pdg_of = dict(zip(zip(df['entry'], df['G4ID']), df['pdg']))
     by_parent = {}
-    for e, p, g in zip(df['entry'], df['parent'], df['pdg']):
-        by_parent.setdefault((e, p), []).append(g)
+    for e, p, g, start in zip(df['entry'], df['parent'], df['pdg'],
+                              df['start_process']):
+        if start == G4_PROCESS_DECAY:
+            by_parent.setdefault((e, p), []).append(g)
 
     out = []
     for e, g4 in zip(kaons['entry'], kaons['G4ID']):
-        hard = sorted(p for p in by_parent.get((e, g4), ())
-                      if p not in SOFT_DAUGHTER_PDGS)
-        out.append(DECAY_MODES.get(tuple(hard), DECAY_MODE_UNKNOWN))
+        products = sorted(by_parent.get((e, g4), ()))
+        out.append(DECAY_MODES.get(tuple(products), DECAY_MODE_UNKNOWN))
     return np.asarray(out, dtype=np.int64)
 
 
