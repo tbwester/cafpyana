@@ -439,6 +439,42 @@ def k_decay_mode(df: pd.DataFrame, kaons: pd.DataFrame) -> np.ndarray:
     return np.asarray(out, dtype=np.int64)
 
 
+#: What the CAF writes into a true particle's trajectory when it stored none: the
+#: whole record at once -- ``endE``, ``start.*``, ``end.*`` -- and ``length`` 0. It
+#: is the only negative value any of those take, so a sign test identifies it
+#: exactly; a real kaon's ``endE`` starts at its mass and nothing lands between.
+CAF_NO_TRAJECTORY = -9999.
+
+#: Columns that carry it, and therefore must not be arithmetic.
+TRAJECTORY_COLUMNS = ('endE', 'start.x', 'start.y', 'start.z',
+                      'end.x', 'end.y', 'end.z', 'length')
+
+
+def _mask_missing_trajectory(kaons: pd.DataFrame) -> pd.DataFrame:
+    """NaN the trajectory of a kaon the CAF stored none for.
+
+    11% of kaons over the reference flatcafs, all with the CAF's own
+    ``contained == 0``. Left raw, the sentinel becomes a *number* in every derived
+    column: ``ke_end`` reads -9999.49 GeV, and since that column exists to say
+    whether the kaon stopped, a ``ke_end < 0.05`` cut then admits every one of them
+    as stopped -- backwards, and silent. ``length`` reads 0 for a kaon of several
+    GeV.
+
+    Containment is unchanged by design rather than by luck: ``InFV`` is False on
+    -9999 and on NaN alike, and ``is_fv_contained`` fills NaN to False, so these
+    kaons stay uncontained -- now for the right reason. ``genE`` comes from the
+    generator and is untouched, so ``E``, ``KE`` and ``P`` remain valid.
+    """
+    kaons = kaons.copy()
+    missing = kaons['endE'] < 0
+    if not missing.any():
+        return kaons
+    for column in TRAJECTORY_COLUMNS:
+        if column in kaons.columns:
+            kaons.loc[missing, column] = np.nan
+    return kaons
+
+
 def make_true_kaon_df(f: dict) -> pd.DataFrame:
     """One row per true charged kaon, with its provenance and kinematics.
 
@@ -472,6 +508,7 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
     if kaons.empty:
         return pd.DataFrame()
 
+    kaons = _mask_missing_trajectory(kaons)
     kaons = kaons.join(resolve_k_origins(tpartdf), on=['entry', 'G4ID'])
 
     # immediate parent, which may itself be a kaon if this segment came from a
@@ -518,7 +555,10 @@ def make_true_kaon_df(f: dict) -> pd.DataFrame:
     # Kinetic energy at the END of the track. E/KE below are from genE, the
     # energy at *production*, which does not say whether the kaon stopped -- and
     # stopping is what makes a Kmu2 muon monochromatic at 258.15 MeV, the
-    # sharpest truth handle in the sample.
+    # sharpest truth handle in the sample. NaN where the CAF stored no
+    # trajectory, which _mask_missing_trajectory has already marked: "no end
+    # recorded" and "ended at rest" must not be the same value in the one column
+    # asked to tell them apart.
     kaons['ke_end'] = kaons['endE'] - KMASS['kplus']
 
     p = np.sqrt(kaons['genp.x']**2 + kaons['genp.y']**2 + kaons['genp.z']**2)
