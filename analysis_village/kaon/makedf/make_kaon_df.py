@@ -1347,3 +1347,101 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
     pair_df = close_pairs.set_index(final_idx).sort_index()
 
     return pair_df
+
+
+# --- per-pfp direction and hierarchy ----------------------------------------
+# The nine per-pfp branches the track table does not carry, for studies that need an
+# angle or Pandora's parentage. Written as its own table and its own pass because it
+# reads no hits and recomputes no chi2: the whole thing is a branch read, so it costs a
+# small fraction of a reco production and does not have to wait for one.
+#
+# Motivating case is a proton control sample -- a nu_mu CC 1mu1p topology, the long track
+# tagging the event and the short contained one at the same vertex being a proton, used to
+# measure the chi2 response of a *known* particle without using chi2 to find it. Everything
+# else that needs is already exported: `track` has the lengths, both end points,
+# trackScore, all nine calorimetry universes and the backtracked truth, and `slice` has the
+# reconstructed vertex. Measured on kcv, that reaches 84% proton purity on the short leg
+# and 94% once a transverse-imbalance cut is added -- and the imbalance is what wants
+# directions, because the chord between the two end points sits over 10 degrees off
+# `trk.dir` for 13% of 20-50 cm tracks and 21% of tracks past a metre.
+#
+# `rangeP.p_muon` and `rangeP.p_proton` are deliberately NOT here: range_momentum.p_muon
+# and p_proton reproduce the CAF's own columns from trk_len to 7e-08 in ratio, so storing
+# them would store a function of a column already exported.
+#
+# No cut is applied beyond the clear-cosmic drop that `track` also applies. A gated
+# variant was tried and measured first -- gating on the 1mu1p topology keeps 17-27% of
+# track rows, because two or three primary tracks with a 30 cm tag is a common topology
+# rather than a rare one -- so it would have bounded every later study of its own gate to
+# save less than a factor of four. Nine narrow columns need no such bargain.
+
+#: ``loadbranches`` output column -> exported name.  Keyed by the dotted name rather than
+#: by a tuple: ``loadbranches`` sets column arity from the deepest branch requested and
+#: pads the rest, so adding a branch one level deeper renumbers every tuple key. Joining
+#: the non-empty parts of each tuple is arity-independent and needs no maintenance.
+PFP_GEOM_COLUMNS = {
+    "pfp.trk.dir.x": "dir_x",
+    "pfp.trk.dir.y": "dir_y",
+    "pfp.trk.dir.z": "dir_z",
+    "pfp.trk.dir_end.x": "dir_end_x",
+    "pfp.trk.dir_end.y": "dir_end_y",
+    "pfp.trk.dir_end.z": "dir_end_z",
+    "pfp.id": "pfp_id",
+    "pfp.parent": "pfp_parent",
+    "pfp.parent_is_primary": "parent_is_primary",
+}
+
+#: Stored narrow. The CAF holds the directions as float32 and the hierarchy as int32, so
+#: float64 would double the product to store nothing -- and this table's whole argument
+#: for being unfiltered is that it is cheap.
+PFP_GEOM_DTYPES = {
+    "dir_x": "float32", "dir_y": "float32", "dir_z": "float32",
+    "dir_end_x": "float32", "dir_end_y": "float32", "dir_end_z": "float32",
+    "pfp_id": "int32", "pfp_parent": "int32", "parent_is_primary": "int8",
+}
+
+#: No parent recorded. -1 rather than 0, which Pandora uses for a real id -- the same trap
+#: ``truth_parent`` documents in ``_extract_base_track_df``.
+PFP_NO_PARENT = -1
+
+
+def make_pfp_geom_df(f: dict) -> pd.DataFrame:
+    """One row per pfp: the track direction at both ends, and its place in the hierarchy.
+
+    Keyed as ``make_track_df`` is -- ``(entry, rec.slc..index, pfp_index)``, with the loader
+    adding ``__ntuple`` -- so within one processing ``track.join(geom)`` is the whole join.
+    **Across** processings it is not: ``__ntuple`` is assigned from the order a job read its
+    inputs, so a geom pass and a reco pass number the same file differently. That is why
+    ``hdr`` and ``file`` ship alongside, exactly as they do for ``kaon_syst_config``: the key
+    that survives is ``(file_key, entry)``.
+
+    Clear cosmics are dropped, matching ``make_track_df`` -- a row ``track`` does not have
+    would join to nothing anyway, and it is a large fraction of the pfps. A shower-like pfp
+    is **kept**, with NaN directions, because what else Pandora put in the slice is part of
+    how a topology cut gets checked.
+    """
+    branches = [f"rec.slc.reco.{name}" for name in PFP_GEOM_COLUMNS]
+    frame = ph.loadbranches(f["recTree"], branches).rec.slc.reco
+    if frame.empty:
+        return pd.DataFrame()
+
+    frame.columns = ['.'.join(n for n in c if n != '') for c in frame.columns]
+    frame = frame[list(PFP_GEOM_COLUMNS)].rename(columns=PFP_GEOM_COLUMNS)
+
+    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
+    if isinstance(slc_df.columns, pd.MultiIndex):
+        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
+    is_cosmic = (slc_df['is_clear_cosmic'] == 1).reindex(frame.index.droplevel(-1))
+    frame = frame[~is_cosmic.to_numpy()]
+    if frame.empty:
+        return pd.DataFrame()
+
+    # INT_MIN in an int column is a number a histogram or a mean would consume.
+    unmatched = np.iinfo(np.int32).min
+    for col, fill in (("pfp_id", PFP_NO_PARENT), ("pfp_parent", PFP_NO_PARENT),
+                      ("parent_is_primary", 0)):
+        frame[col] = frame[col].replace(unmatched, fill).fillna(fill)
+
+    frame = frame.astype(PFP_GEOM_DTYPES)
+    frame.index = frame.index.set_names([*frame.index.names[:-1], "pfp_index"])
+    return frame.sort_index()
