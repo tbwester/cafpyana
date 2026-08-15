@@ -28,8 +28,12 @@ SBND_CALO_PARAMS = {
     "gains": [
         ## MC: sbndcode calorimetry_sbnd.fcl, sbnd_calorimetryalgmc.CalAreaConstants
         [0.02052, 0.02044, 0.02019], ## MC
-        ## Data would be [0.02172, 0.02150, 0.02103] by the same fcl
-        [0.02, 0.02, 0.02]], ## Data
+        ## Data: the same fcl gives [0.02172, 0.02150, 0.02103], multiplied here by
+        ## 0.9753 -- the plane-independent remainder the control samples measure, which
+        ## belongs in c_cal_frac but cannot go there because c_cal_frac is indexed by
+        ## plane alone and would move MC too. dedx() forms dqdx/(gain*c_cal_frac), so
+        ## only the product is observable and this is identical. notebook_v3 V3.51.
+        [0.0211835, 0.0209689, 0.0205106]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
 }
