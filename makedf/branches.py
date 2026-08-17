@@ -227,14 +227,16 @@ trkhitbranches_perplane = lambda IPLANE : [
     trkbranch + "calo.%i.points.y"% IPLANE,
     trkbranch + "calo.%i.points.z"% IPLANE,
 
-    #trkbranch + "calo.%i.points.width"% IPLANE,
-    #trkbranch + "calo.%i.points.mult"% IPLANE,
+    trkbranch + "calo.%i.points.width"% IPLANE,
+    trkbranch + "calo.%i.points.mult"% IPLANE,
     #trkbranch + "calo.%i.points.tdc0"% IPLANE,
 ]
 
 trktruehitbranches_perplane = lambda IPLANE : [
     trkbranch + "calo.%i.points.truth.h_e"% IPLANE,
     trkbranch + "calo.%i.points.truth.h_nelec"% IPLANE,
+    trkbranch + "calo.%i.points.truth.rr"% IPLANE,
+    trkbranch + "calo.%i.points.truth.pitch"% IPLANE,
 ]
 
 trkhitbranches = trkhitbranches_perplane(2)

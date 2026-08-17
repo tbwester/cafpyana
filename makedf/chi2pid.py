@@ -73,7 +73,17 @@ def chi2(hitdf, exprr, expdedx, experr, dedxname="dedx"):
     dedx_exp = pd.cut(hitdf.rr, exprr, labels=expdedx).astype(float)
     dedx_err = pd.cut(hitdf.rr, exprr, labels=experr).astype(float)
 
-    dedx_res = (0.04231 + 0.0001783*hitdf[dedxname]**2)*hitdf[dedxname]
+    # Evaluated at the EXPECTATION, not at the measurement.  A pull is a
+    # standardised residual only if its denominator is the sampling spread given
+    # the truth: (x-mu)/sigma(mu) is unit-normal, (x-mu)/sigma(x) is not --
+    # conditioning on the realised value shrinks upward fluctuations and
+    # magnifies downward ones.  Measured on the 1mu1p control protons with only
+    # this argument changed, the pooled pull width falls 5.185 -> 4.056, the skew
+    # halves, and the data/MC chi2 ratio falls 1.731 -> 1.465.  It moves a
+    # data/MC ratio despite being applied to both samples because a denominator
+    # conditioned on the observation is not common-mode -- it inherits each
+    # sample's own fluctuation distribution.  notebook_v3 CALO.64-CALO.65.
+    dedx_res = (0.04231 + 0.0001783*dedx_exp**2)*dedx_exp
 
     v_chi2 = (hitdf[dedxname] - dedx_exp)**2 / (dedx_err**2 + dedx_res**2)
 
