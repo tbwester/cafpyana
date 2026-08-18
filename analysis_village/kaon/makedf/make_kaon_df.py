@@ -1113,7 +1113,21 @@ def _extract_base_track_df(f: dict):
             # Rebuilding it as integral/pitch cannot reproduce it: Gnocchi runs
             # with ChargeMethod 3 and sums the integrals over the hit's snippet,
             # and only the primary hit's integral is in the file.
-            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params, charge="dqdx")
+            # The derived calorimetry chain: level -> reco -> absorb -> saturation ->
+            # smear, on the calibrated charge, before the recombination inversion.  The
+            # last three are MC-only and `sbnd_calo_chain` enforces that.  The fitted
+            # blocks are held at nominal in every universe, so each variation is a
+            # variation about the CORRECTED central value -- which is what a covariance
+            # built from them assumes.  See docs/patches/cafpyana_sbnd_calo_chain.patch.
+            #
+            # calo_seed is derived from the hits themselves, never from a counter: the
+            # smear is the one stochastic rung, and a running seed would make the product
+            # depend on the order its inputs were read.  Two passes over the same
+            # flatcafs in a different order would then disagree, silently.
+            calo_seed = int(pd.util.hash_pandas_object(
+                trkhitdf.index.droplevel(-1).to_frame(index=False), index=False).sum()
+                % (2 ** 31))
+            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params, charge="dqdx", calo_chain=True, calo_seed=calo_seed)
             trkhitdf["dedx_redo"] = dedx_redo
 
             # Recalculate Chi2 for Muon, Proton, Kaon and Pion

@@ -28,12 +28,16 @@ SBND_CALO_PARAMS = {
     "gains": [
         ## MC: sbndcode calorimetry_sbnd.fcl, sbnd_calorimetryalgmc.CalAreaConstants
         [0.02052, 0.02044, 0.02019], ## MC
-        ## Data: the same fcl gives [0.02172, 0.02150, 0.02103], multiplied here by
-        ## 0.9753 -- the plane-independent remainder the control samples measure, which
-        ## belongs in c_cal_frac but cannot go there because c_cal_frac is indexed by
-        ## plane alone and would move MC too. dedx() forms dqdx/(gain*c_cal_frac), so
-        ## only the product is observable and this is identical. notebook_v3 V3.51.
-        [0.0211835, 0.0209689, 0.0205106]], ## Data
+        ## Data: the reco2 fcl's own gains, with NOTHING FITTED -- this is "setting F".
+        ##
+        ## It was [0.0211835, 0.0209689, 0.0205106], i.e. these times a fitted
+        ## plane-independent 0.9753 (V3.51).  That remainder is REMOVED here, because the
+        ## per-(itpc, plane) level in SBND_TPC_PLANE_LEVEL replaces it and was derived
+        ## against setting F's charge.  Leaving the 0.9753 in would make the data charge
+        ## entering sbnd_calo_chain 2.53% larger than the charge the level was measured
+        ## on, so the level would under-correct data by 2.53% on every plane -- silently.
+        ## Do not restore it without re-deriving the level.  CALO.87, CALO.105.
+        [0.02172, 0.02150, 0.02103]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
 }
@@ -253,7 +257,341 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
 
     return dqdx*gain_perhit
 
-def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral"):
+##############################
+# THE SBND CALORIMETRY CHAIN (derived by kaonana.calo, CALO.91-CALO.104)
+#
+# Order:  level -> reco -> absorb -> saturation -> smear -> invert.  NOT FREE.
+#   * `level` is a data-side gain, so it acts first, before anything charge-dependent.
+#   * `reco` is a reconstruction defect and applies to BOTH samples.
+#   * `absorb`, `saturation`, `smear` are MC-ONLY.  Applying them to data is not a
+#     bug, it is a wrong measurement.
+#   * `saturation` is a power law in the charge `absorb` produced, so applying it to
+#     the raw charge evaluates the knee in the wrong variable.
+#   * everything acts on CHARGE; recombination is inverted once, at the end.
+#
+# Two of the five carry no fitted numbers at all -- the absorbing factor and the
+# correlated field -- so a patch with only the constant blocks below is wrong by
+# ~5% in dE/dx and will look plausible.
+#
+# See docs/patches/cafpyana_sbnd_calo_chain.patch for what each rung is and why.
+##############################
+
+#: The charge the reconstruction lost, per PLANE (TPC-independent to 0.2%).  BOTH SAMPLES.
+#: Fitted on Geant4 truth: closes MC to its own truth 0.955 -> 0.998, and the closure holds
+#: for protons and muons alike (0.93-0.94), which is what makes it a chain effect.
+#:
+#: These are the POOLED per-plane fits, not the mean of the two per-TPC fits.  A mean of two fits
+#: is not a fit -- it lands ~0.2% off in the correction and, because the saturation's knee is a
+#: kink, up to tens of percent on individual near-knee hits.  Re-derive with
+#: `--planes 0 1 2` (no `--tpcs`) if these are ever refreshed.  Track-weighted (CALO.107).
+SBND_RECO_CORRECTION = {
+    0: dict(q0=130000, a0=0.0466985792, a1=-0.0651132686, a2=-0.0278776686),
+    1: dict(q0=130000, a0=0.0468439409, a1=-0.0878337296, a2=-0.0281752486),
+    2: dict(q0=130000, a0=0.0289619024, a1=-0.040410619, a2=-0.0427837696),
+}
+
+#: A DATA-side dQ/dx scale per (itpc, plane).  MC is 1.0 by construction: this is a
+#: calibration, not a correction to the simulation.  It cannot live in `gains` or
+#: `c_cal_frac`, which are indexed by plane alone.
+#:
+#: Almost all of it is (1, 0) at 4.8%, where the proton and stopping-muon legs agree to
+#: 0.07%.  *** (0, 1) is deliberately ~1: *** its two legs disagree at chi2 5.4 on one
+#: degree of freedom (protons +2.6%, muons -2.0%), so no correction is applied there.  Do
+#: not replace it with the proton-only number -- that was withdrawn at CALO.102.
+SBND_TPC_PLANE_LEVEL = {
+    (0, 0): 0.988313,
+    (1, 0): 0.963561,
+    (0, 1): 0.995309,  # species chi2 5.4: no correction, deliberately.  See the header.
+    (1, 1): 0.998391,
+    (0, 2): 0.999731,
+    (1, 2): 0.990689,
+}
+
+#: The above-knee charge factor on MC, per (itpc, plane).
+#:
+#: *** FROZEN above q_max, and that is not optional. ***  Unbounded, this rung makes the
+#: per-track chi2 shape WORSE than no correction at all -- delta 0.125 against an
+#: uncorrected 0.104 -- and 1.5% of hits decide it.  Freeze, do not clip to 1: above the
+#: last fitted cell the correction is real but unmeasured, and holding the last measured
+#: value is the weaker of the two assumptions.
+#:
+#: b1 is -0.14 on both induction planes and -0.35 on the collection plane, a factor 2.5 at
+#: 6.4 sigma.  The least trustworthy rung in the chain: above 12 MeV/cm on a stopping proton
+#: is inside ~0.5 cm of the track end, where MC carries an end-placement error, and a charge
+#: saturation and a misplaced end bias the same ratio in the same hits.  Nothing in the
+#: control sample separates them.
+SBND_SATURATION = {
+    (0, 0): dict(knee=165052, b0=0.0135411, b1=-0.162002, b2=-0.05443,
+                 p0=0.42, q_max=254981),
+    (1, 0): dict(knee=157153, b0=0.0042521, b1=-0.123429, b2=-0.0486317,
+                 p0=0.42, q_max=245650),
+    (0, 1): dict(knee=153346, b0=0.0202639, b1=-0.168899, b2=-0.0339018,
+                 p0=0.42, q_max=258987),
+    (1, 1): dict(knee=153346, b0=0.00634117, b1=-0.101189, b2=-0.0432164,
+                 p0=0.42, q_max=246092),
+    (0, 2): dict(knee=191213, b0=-0.00638476, b1=-0.328385, b2=-0.000802373,
+                 p0=0.42, q_max=278890),
+    (1, 2): dict(knee=195959, b0=0.008889, b1=-0.400159, b2=-0.077716,
+                 p0=0.42, q_max=281817),
+}
+
+#: The correlated smear per (itpc, plane).  MC only, and STOCHASTIC.
+#:
+#: THREE BASES ARE SUPPORTED AND THE KEY NAMES SELECT ONE:
+#:   `amplitude`      -- a fractional CHARGE wobble, used as it stands.
+#:   `amplitude_dedx` -- a fractional dE/dx wobble, divided by each hit's own
+#:                       `sbnd_amplification` before it is applied.
+#:   `amplitude_dedx` + `power` + `rr0`
+#:                    -- the same, times (rr/rr0)**-power.                     <-- SHIPPED
+#: Give exactly one amplitude key.  Switching basis is a constant-block edit, not a code change.
+#:
+#: WHY THE SHAPE.  kaonana CALO.119/120.  The dE/dx basis fixes the SPECIES dependence -- the control
+#: sample's two legs disagree on the amplitude by +37.4% (9.9 sigma) in charge and +4.0% (1.4 sigma) in
+#: dE/dx, the difference being the amplification -- and supplies no rr dependence.  The charge basis
+#: supplies an rr dependence by ACCIDENT, because the amplification rises toward the track end, and
+#: overshoots it: an effective power of ~0.135 against the ~0.083 the data wants.  So neither pure basis
+#: is right.  The fitted power is +0.0639 +- 0.0098, shared by all six cells, and the shape it gives
+#: rises 12.5% from rr 19 to 3 cm against the +12.3% CALO.113 measured by an unrelated route.
+#:
+#: *** FLAT dE/dx WAS TRIED AND REVERTED AT CALO.113.  DO NOT SHIP `amplitude_dedx` WITHOUT `power`. ***
+#: Flat dE/dx is better on the statistic it is fitted to (the control sample's per-hit width closes 25%
+#: better on the held-out muon leg) and WORSE on the analysis: the kmu BDT inputs went -32% -> -19%
+#: against the uncorrected baseline and kpi -42% -> -27%, with 9 of 16 and 13 of 19 features degrading.
+#: CALO.120 diagnosed the cause as the missing rr dependence, which `power` restores.
+#:
+#: KNOWN OPEN, and it is a systematic rather than a defect in this code: the muon leg agrees with the
+#: proton-derived shape pooled (a0 ratio 0.991) and not per cell, and the residual is structured by TPC
+#: -- 0.906 in TPC 0 against 1.094 in TPC 1, a 3.7 sigma split, unexplained (CALO.122).  Booked as an
+#: antisymmetric +-9.5% on the amplitude, which is 1.3-1.6% of per-hit width within a TPC and 0.03-0.3%
+#: pooled over them (CALO.123).
+#:
+#: The reason is a shape the charge basis gets right by accident.  The amplification RISES toward the
+#: track end (1.39 -> 1.70 over rr 20 -> 4.5 cm), so a flat charge amplitude delivers a dE/dx wobble
+#: that rises with it, and that is the shape the data wants -- needed [1, 1.089, 1.123] against
+#: charge's [1, 1.083, 1.218] and a flat dE/dx's [1, 1, 1].  The charge basis is a working proxy for an
+#: rr dependence nobody has fitted.
+SBND_MC_NOISE = {
+    (0, 0): dict(amplitude_dedx=0.0750281, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.7534),
+    (0, 1): dict(amplitude_dedx=0.0890333, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.67),
+    (0, 2): dict(amplitude_dedx=0.0592533, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.7063),
+    (1, 0): dict(amplitude_dedx=0.0693117, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5696),
+    (1, 1): dict(amplitude_dedx=0.0889418, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5629),
+    (1, 2): dict(amplitude_dedx=0.0587694, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5786),
+}
+
+#: The smallest fraction of its own charge a smeared hit may keep.  At these amplitudes it
+#: needs a 20-sigma excursion and never fires; it exists because a non-positive charge maps
+#: to NaN through the inversion and then poisons every quantile of the band it sits in.
+SBND_CHARGE_FLOOR = 0.05
+
+
+def sbnd_level_scale(itpc, plane, isMC=False):
+    """The data-side per-(itpc, plane) dQ/dx scale.  1.0 everywhere for MC."""
+    itpc = np.asarray(itpc, dtype=int)
+    out = np.ones(len(itpc))
+    if isMC:
+        return out
+    for tpc in np.unique(itpc):
+        scale = SBND_TPC_PLANE_LEVEL.get((int(tpc), int(plane)))
+        if scale is not None:
+            out[itpc == tpc] = scale
+    return out
+
+
+def sbnd_reco_factor(charge, phi, plane):
+    """The reco charge correction: ln c = a0 + a1 ln(q/q0) + a2 (cos^2 phi - 0.25)."""
+    block = SBND_RECO_CORRECTION.get(int(plane))
+    charge = np.asarray(charge, dtype=float)
+    if block is None:
+        return np.ones(len(charge))
+    angular = np.cos(np.asarray(phi, dtype=float)) ** 2 - 0.25
+    return np.exp(block["a0"] + block["a1"] * np.log(np.clip(charge, 1.0, None) / block["q0"])
+                  + block["a2"] * angular)
+
+
+def sbnd_absorbing_factor(charge, phi, efield, density, calo_params):
+    """MC's charge scaled so that MC's inversion reports what DATA's would.
+
+    Parameter-free: the closed-form ratio of the two samples' own recombination inversions,
+    worth -7% to +25% in dE/dx and sign-changing with angle.  Uses `calo_params`, so in a
+    varied universe it follows that universe -- there is no fit to redo.
+    """
+    charge = np.asarray(charge, dtype=float)
+    energy = calo.recombination_cor(charge, phi, efield, density,
+                                    calo_params["alpha_emb"][1], calo_params["beta_90"][1],
+                                    calo_params["R_emb"][1])
+    wanted = calo.recombination(np.asarray(energy, dtype=float), phi, efield, density,
+                                calo_params["alpha_emb"][0], calo_params["beta_90"][0],
+                                calo_params["R_emb"][0])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(charge > 0, np.asarray(wanted, dtype=float) / charge, 1.0)
+
+
+def sbnd_saturation_factor(charge, pitch, itpc, plane):
+    """The above-knee factor on MC's charge, FROZEN above q_max.  See SBND_SATURATION."""
+    charge = np.asarray(charge, dtype=float)
+    pitch = np.asarray(pitch, dtype=float)
+    itpc = np.asarray(itpc, dtype=int)
+    out = np.ones(len(charge))
+    for tpc in np.unique(itpc):
+        block = SBND_SATURATION.get((int(tpc), int(plane)))
+        if block is None:
+            continue
+        rows = itpc == tpc
+        bounded = np.minimum(np.where(charge[rows] > 0.0, charge[rows], 0.0), block["q_max"])
+        with np.errstate(divide="ignore"):
+            above = np.maximum(0.0, np.log(bounded / block["knee"]))
+        out[rows] = np.exp(block["b0"] + block["b1"] * above
+                           + block["b2"] * np.log(pitch[rows] / block["p0"]))
+    return out
+
+
+def sbnd_correlated_field(rr, track_id, length_cm, seed):
+    """A unit-variance field per hit, correlated along each track as exp(-|ds| / L).
+
+    An Ornstein-Uhlenbeck recursion in DISTANCE, not in hit index: the pitch varies
+    0.35-0.50 cm across this sample, so a hit-index correlation would be a different
+    physical length on every track.  Reset at every track boundary.
+
+    A loop rather than a cumulative product on purpose -- the product form underflows,
+    since exp(-0.42/0.68) to the fortieth hit is 1e-11.
+    """
+    rr = np.asarray(rr, dtype=float)
+    track = np.asarray(track_id)
+    order = np.lexsort((rr, track))
+    same = np.zeros(len(order), dtype=bool)
+    if len(order) > 1:
+        same[1:] = track[order][1:] == track[order][:-1]
+    step = np.zeros(len(order))
+    step[1:] = np.abs(np.diff(rr[order]))
+    weight = np.where(same, np.exp(-step / max(length_cm, 1e-9)), 0.0)
+    noise = np.random.default_rng(seed).standard_normal(len(order))
+    field = np.empty(len(order))
+    previous = 0.0
+    for index in range(len(order)):
+        w = weight[index]
+        previous = w * previous + np.sqrt(max(1.0 - w * w, 0.0)) * noise[index]
+        field[index] = previous
+    out = np.empty(len(order))
+    out[order] = field
+    return out
+
+
+
+def sbnd_amplification(charge, phi, efield, density, calo_params, step=0.01):
+    """`d ln(dE/dx) / d ln(q)` per hit, by a central difference through the REAL inversion.
+
+    This is the factor a fractional charge wobble is multiplied by on its way to dE/dx, and it
+    runs ~1.13 on MIP-like hits to ~1.93 at the top of the stopping-proton range.  Dividing the
+    dE/dx amplitude by it per hit is what makes `SBND_MC_NOISE` deliver a CONSTANT fractional
+    dE/dx width -- see the comment on that block.
+
+    USES INDEX 0, WHICH IS MC.  `dedx()` below picks `[0] if isMC else [1]` and that is the
+    convention: slot 0 is the MC ModBox set, slot 1 is data's.  This function shipped with `[1]`
+    while its docstring claimed index 1 was MC -- so an MC-only correction was being scaled by
+    DATA's recombination, ~1% out in the amplification and straight through to the applied
+    amplitude.  It never reached a product because the dE/dx basis it was written for was
+    reverted at CALO.113; the cross-check that caught it is in kaonana's test suite (CALO.124).
+    Note `sbnd_absorbing_factor` above genuinely does use both slots, and its 1-then-0 order is
+    deliberate: it inverts with data's constants and re-forwards with MC's.
+    """
+    charge = np.asarray(charge, dtype=float)
+    alpha, beta, R = (calo_params["alpha_emb"][0], calo_params["beta_90"][0],
+                      calo_params["R_emb"][0])
+    up = calo.recombination_cor(charge * (1.0 + step), phi, efield, density, alpha, beta, R)
+    down = calo.recombination_cor(charge * (1.0 - step), phi, efield, density, alpha, beta, R)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.log(np.asarray(up, dtype=float) / np.asarray(down, dtype=float)) / np.log(
+            (1.0 + step) / (1.0 - step))
+    # FLOORED AT 1.0, WHICH IS PHYSICS.  Recombination quenches more at higher deposition, so a
+    # fractional charge increase always buys a LARGER fractional dE/dx increase: this derivative
+    # cannot be below 1 and tends to 1 from above as the deposition falls.  5.3% of MC control hits
+    # come back below 1 and 0.01% below 0.16, all at dE/dx ~1.7 MeV/cm -- below the MIP minimum,
+    # where the inversion is being asked about charge no track deposits.  A 0.1 floor instead lets a
+    # 6% dE/dx amplitude become a 40% charge smear on such a hit.  See kaonana CALO.124.
+    return np.where(np.isfinite(out), np.maximum(out, 1.0), 1.0)
+
+
+def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, density,
+                      calo_params):
+    """The stochastic factor on MC's charge.
+
+    Reads whichever amplitude key `SBND_MC_NOISE` carries -- `amplitude` (charge) or `amplitude_dedx`
+    (divided per hit by `sbnd_amplification`), optionally with `power`/`rr0` for the shipped rr shape.
+    See the comment on that block for why, and for what happened when flat dE/dx was tried.
+
+    THE SEED MUST BE DERIVED FROM THE DATA, NOT FROM A STREAM.  A running counter would make
+    a product depend on the order its inputs were read: two passes over the same flatcafs in
+    a different order would disagree, and nothing would complain.  The caller passes a hash
+    of the file's track keys; this mixes in the cell.
+    """
+    itpc = np.asarray(itpc, dtype=int)
+    out = np.ones(len(np.asarray(rr)))
+    amplification = None
+    for tpc in np.unique(itpc):
+        block = SBND_MC_NOISE.get((int(tpc), int(plane)))
+        if block is None:
+            continue
+        rows = itpc == tpc
+        cell_seed = (int(seed) ^ (int(tpc) << 8) ^ (int(plane) << 16)) & 0x7FFFFFFF
+        field = sbnd_correlated_field(np.asarray(rr)[rows], np.asarray(track_id)[rows],
+                                      block["length_cm"], cell_seed)
+        if "amplitude" in block:
+            amplitude = block["amplitude"]
+        elif "amplitude_dedx" in block:
+            if amplification is None:
+                amplification = sbnd_amplification(charge, phi, efield, density, calo_params)
+            amplitude = block["amplitude_dedx"] / amplification[rows]
+            if "power" in block:
+                # The rr shape, FROZEN outside the range it was fitted in.  A power law in rr is an
+                # extrapolation below the lowest fitted band and (rr/rr0)**-power diverges as rr -> 0;
+                # the analysis smears every hit, including the rr < 1 cm ones the derivation's floor
+                # excluded, and unfrozen that reached a 1.81 factor at rr ~ 1e-3 cm against 1.11 at the
+                # lowest fitted band.  Same freeze as SBND_SATURATION's pitch term, same reason.
+                low, high = block.get("rr_range", (2.0, 26.0))
+                clipped = np.clip(np.asarray(rr, dtype=float)[rows], low, high)
+                amplitude = amplitude * (clipped / block["rr0"]) ** -block["power"]
+        else:
+            raise KeyError(f"SBND_MC_NOISE[{int(tpc)}, {int(plane)}] has neither "
+                           "`amplitude` (charge) nor `amplitude_dedx`")
+        out[rows] = np.maximum(1.0 + amplitude * field, SBND_CHARGE_FLOOR)
+    return out
+
+
+def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True):
+    """The five rungs, in the only order that is right.  Returns CORRECTED CHARGE.
+
+    `charge` is the CALIBRATED dQ/dx -- gain, lifetime and YZ already in.  The recombination
+    inversion happens after this returns, once.
+
+    The FITTED blocks are held at their nominal values in every calo universe, so each
+    variation is a variation about the corrected central value, which is what a covariance
+    built from them assumes.  `absorb` is the exception and uses each universe's own
+    constants, because it is a closed form of them rather than a fit.
+    """
+    charge = np.asarray(charge, dtype=float)
+    itpc = np.asarray(dqdxdf.tpc)
+    phi = np.asarray(dqdxdf.phi, dtype=float)
+    charge = charge * sbnd_level_scale(itpc, plane, isMC=isMC)
+    charge = charge * sbnd_reco_factor(charge, phi, plane)
+    if not isMC:
+        return charge
+    charge = charge * sbnd_absorbing_factor(charge, phi, np.asarray(dqdxdf.efield, dtype=float),
+                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
+    charge = charge * sbnd_saturation_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
+                                             itpc, plane)
+    if smear:
+        levels = list(range(dqdxdf.index.nlevels - 1))
+        track = (np.asarray(dqdxdf.index.droplevel(-1).to_numpy()) if levels
+                 else np.zeros(len(charge), dtype=int))
+        charge = charge * sbnd_smear_factor(np.asarray(dqdxdf.rr, dtype=float), track,
+                                            itpc, plane, seed, charge, phi,
+                                            np.asarray(dqdxdf.efield, dtype=float),
+                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
+    return charge
+
+
+def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral", calo_chain=False, calo_seed=0, calo_smear=True):
     dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC, charge=charge)
     if gain == "SBND":
 
@@ -266,7 +604,12 @@ def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale
         this_alpha_emb = calo_params["alpha_emb"][0] if isMC else calo_params["alpha_emb"][1]
         this_beta_90 = calo_params["beta_90"][0] if isMC else calo_params["beta_90"][1]
         this_R_emb = calo_params["R_emb"][0] if isMC else calo_params["R_emb"][1]
-        dedx = calo.recombination_cor(scale*dqdx_v/scalegain, dqdxdf.phi, dqdxdf.efield, dqdxdf.rho, this_alpha_emb, this_beta_90, this_R_emb)
+        this_dqdx = scale*dqdx_v/scalegain
+        if calo_chain:
+            # The five derived rungs, on the CALIBRATED charge, before the inversion.
+            this_dqdx = sbnd_calo_chain(dqdxdf, this_dqdx, plane, isMC, calo_params,
+                                        seed=calo_seed, smear=calo_smear)
+        dedx = calo.recombination_cor(this_dqdx, dqdxdf.phi, dqdxdf.efield, dqdxdf.rho, this_alpha_emb, this_beta_90, this_R_emb)
 
     elif gain == "ICARUS":
         scalegain = ICARUS_CALO_PARAMS['c_cal_frac'][plane]
