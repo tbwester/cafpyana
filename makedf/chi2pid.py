@@ -260,12 +260,13 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
 ##############################
 # THE SBND CALORIMETRY CHAIN (derived by kaonana.calo, CALO.91-CALO.104)
 #
-# Order:  level -> reco -> absorb -> saturation -> smear -> invert.  NOT FREE.
+# Order:  level -> smear -> turnon -> invert.  NOT FREE.
+#   `absorb` is RETIRED (CALO.143) -- see sbnd_calo_chain.
 #   * `level` is a data-side gain, so it acts first, before anything charge-dependent.
 #   * `reco` is a reconstruction defect and applies to BOTH samples.
-#   * `absorb`, `saturation`, `smear` are MC-ONLY.  Applying them to data is not a
+#   * `saturation` and `smear` are MC-ONLY.  Applying them to data is not a
 #     bug, it is a wrong measurement.
-#   * `saturation` is a power law in the charge `absorb` produced, so applying it to
+#   * the turn-on is a factor on the CALIBRATED charge, so applying it to
 #     the raw charge evaluates the knee in the wrong variable.
 #   * everything acts on CHARGE; recombination is inverted once, at the end.
 #
@@ -624,6 +625,89 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
     return out
 
 
+#: The ladder's charge correction, kaonana CALO.145 rebuilt and CALO.163 reparameterised.  REPLACES
+#: `SBND_SATURATION` in `sbnd_calo_chain`; that block stays defined for the figures that cite it.
+#:
+#:     ln factor = ref_level + ln(depth) * (S(q) - S(q_ref)) / (S(q_hi) - S(q_lo))
+#:                 + b2 * ln(pitch / p0)
+#:     S(q)      = s * logaddexp(0, ln(q / knee) / s)
+#:
+#: `ref_level` is the log factor at Q_REF; `depth` is factor(Q_HIGH) / factor(Q_LOW).  THE THREE
+#: ANCHORS ARE FIXED AND SHARED -- 6.0e4, 1.2e5, 2.4e5 -- and are NOT each block's [q_min, q_max].
+#: Anchoring on the window instead would make `depth` mean a different thing in every cell and
+#: silently rescale the correction; nothing downstream would flag it.
+#:
+#: `knee` and `s` are SCANNED AND HELD, not fitted: they define the basis.  `(b0, b1)` are absent by
+#: design -- `b1` is degenerate with the knee and floats 37-123% across the region the chi2 cannot
+#: distinguish, while the curve it describes holds to 0.5%.  Quoting it would be quoting noise.
+#:
+#: Frozen outside [q_min, q_max] AND outside [pitch_min, pitch_max].  Both matter: `b2` is a pitch
+#: coefficient and plane 2's window is only 0.30-0.75, so an unfrozen tilt extrapolates hard.
+#:
+#: Six independent fits, nothing pooled across TPCs or planes.  `depth` is consistent with one number
+#: (0.9399 +- 0.0039); `ref_level` is decisively per-cell.  A log-linear alternative -- which is what
+#: `sbnd_reco_factor` is -- loses in ALL SIX at chi2/dof up to 3.353 against 1.272, with the
+#: curvature significant at 2.4-8.1 sigma.  That is why `reco` is not a substitute for this rung.
+SBND_CHARGE_TURNON = {
+    (0, 0): dict(ref_level=0.014, depth=0.94684, b2=-0.03498,
+                 knee=227670.5, s=0.09487, q_min=50939.0, q_max=266493.0,
+                 pitch_min=0.3, pitch_max=1.6),
+    (0, 1): dict(ref_level=0.00803, depth=0.93795, b2=-0.01225,
+                 knee=171238.2, s=0.05335, q_min=51504.0, q_max=260261.0,
+                 pitch_min=0.3, pitch_max=1.7),
+    (0, 2): dict(ref_level=-0.00047, depth=0.93043, b2=-0.02415,
+                 knee=207591.1, s=0.08215, q_min=50089.0, q_max=265293.0,
+                 pitch_min=0.3, pitch_max=0.75),
+    (1, 0): dict(ref_level=0.03653, depth=0.94348, b2=-0.0276,
+                 knee=227670.5, s=0.1687, q_min=50908.0, q_max=269680.0,
+                 pitch_min=0.3, pitch_max=1.6),
+    (1, 1): dict(ref_level=0.0118, depth=0.94529, b2=-0.01456,
+                 knee=231843.2, s=0.25979, q_min=51362.0, q_max=269954.0,
+                 pitch_min=0.3, pitch_max=1.7),
+    (1, 2): dict(ref_level=0.01164, depth=0.95079, b2=-0.03231,
+                 knee=249334.8, s=0.08215, q_min=50218.0, q_max=261276.0,
+                 pitch_min=0.3, pitch_max=0.75),
+}
+
+#: The anchors `depth` is defined on.  Constants, not tunables -- see SBND_CHARGE_TURNON.
+SBND_TURNON_ANCHORS = dict(q_low=60000.0, q_ref=120000.0, q_high=240000.0, p0=0.42)
+
+
+def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
+    """The charge turn-on on MC's charge, frozen outside its fitted charge AND pitch windows.
+
+    Verified against kaonana's `softplus_turnon` on all six cells to 2.2e-16
+    (`sandbox_lowvar/port_turnon.py`).  Every cell is checked separately on purpose: this block is
+    keyed `(itpc, plane)` while kaonana's registry is keyed `"t0p2"`, built the other way round, and a
+    transposition is nearly invisible on plane 1 -- where the two cells differ least -- and wrong
+    everywhere else.  Three of the five defects CALO.124 found were transport bugs of that kind.
+    """
+    charge = np.asarray(charge, dtype=float)
+    pitch = np.asarray(pitch, dtype=float)
+    itpc = np.asarray(itpc, dtype=int)
+    out = np.ones(len(charge))
+    anchors = SBND_TURNON_ANCHORS
+    for tpc in np.unique(itpc):
+        block = SBND_CHARGE_TURNON.get((int(tpc), int(plane)))
+        if block is None:
+            continue
+        rows = itpc == tpc
+        q = np.clip(charge[rows], block["q_min"], block["q_max"])
+        p = np.clip(pitch[rows], block["pitch_min"], block["pitch_max"])
+        s, knee = block["s"], block["knee"]
+
+        def softplus(value, s=s, knee=knee):
+            return s * np.logaddexp(0.0, np.log(value / knee) / s)
+
+        low = softplus(anchors["q_low"])
+        high = softplus(anchors["q_high"])
+        reference = softplus(anchors["q_ref"])
+        shape = (softplus(q) - reference) / (high - low)
+        out[rows] = np.exp(block["ref_level"] + np.log(block["depth"]) * shape
+                           + block["b2"] * np.log(p / anchors["p0"]))
+    return out
+
+
 def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True):
     """The five rungs, in the only order that is right.  Returns CORRECTED CHARGE.
 
@@ -658,16 +742,39 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
 
     The FITTED blocks are held at their nominal values in every calo universe, so each
     variation is a variation about the corrected central value, which is what a covariance
-    built from them assumes.  `absorb` is the exception and uses each universe's own
-    constants, because it is a closed form of them rather than a fit.
+    built from them assumes.
+
+    `absorb` IS RETIRED AND THIS FUNCTION NO LONGER CALLS IT (kaonana CALO.143).  It was never a
+    correction: `absorbing_factor` is `R_MC(Rinv_data(q, phi), phi) / q`, so feeding its output
+    through MC's own inversion gives `Rinv_data(q)` exactly -- proven to 1.3e-15.  Applying it and
+    then inverting with MC's ModBox therefore delivered DATA's ModBox for MC, which is the opposite
+    of the decision (MC's ModBox, one inversion).  It is a CHOICE OF INVERSION, not a rung, and
+    keeping both was double-counting worth -7% to +25% in dE/dx and sign-changing with angle.
+
+    `sbnd_absorbing_factor` is deliberately LEFT DEFINED.  It is the closed form of the alternative
+    choice, so anyone wanting data's ModBox should call it here and invert with MC's -- or invert with
+    data's slot and not call it.  What is wrong is doing both, which is what this patch removes.
+    Its own two-slot use is correct and is checked (see the note on `sbnd_amplification`).
+
+    A side effect worth having: the retired rung was the only source of NON-POSITIVE charge in the
+    chain.  It returned values down to -161.7 for 70 of 87,626 plane-2 MC hits, all at calibrated
+    charge 15-3761 e/cm against a MIP's ~54,000, and `sbnd_saturation_factor` then turned those into
+    NaN -- for a block without `b3`, `ramp` is 0.0, the clipped charge is 0, `log(0)` is -inf, and
+    `0.0 * -inf` is NaN rather than 0.  NaN charge becomes NaN dE/dx, NaN chi2, and a NaN BDT feature
+    that xgboost absorbs silently.  With `absorb` gone, no hit is sent non-positive.  The `0.0 * -inf`
+    trap in the saturation is still latent and still worth guarding; nothing feeds it now.
     """
     charge = np.asarray(charge, dtype=float)
     itpc = np.asarray(dqdxdf.tpc)
     phi = np.asarray(dqdxdf.phi, dtype=float)
     charge = charge * sbnd_level_scale(itpc, plane, isMC=isMC)
-    # The smear, on the CALIBRATED charge -- see the docstring.  MC only, so it is guarded here
-    # rather than relying on the `not isMC` return below, now placed after it.
-    if isMC and smear:
+    # Everything past here is MC-only, so data leaves now.  The early return moved up from below
+    # `reco` when `reco` was dropped, which is what makes the guard on the smear unnecessary.
+    if not isMC:
+        return charge
+    # The smear FIRST, on the calibrated charge -- see the docstring.  With `reco` gone there is
+    # nothing at all between the input and the gate, so the fitted knee is exactly in its own basis.
+    if smear:
         levels = list(range(dqdxdf.index.nlevels - 1))
         track = (np.asarray(dqdxdf.index.droplevel(-1).to_numpy()) if levels
                  else np.zeros(len(charge), dtype=int))
@@ -675,13 +782,8 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
                                             itpc, plane, seed, charge, phi,
                                             np.asarray(dqdxdf.efield, dtype=float),
                                             np.asarray(dqdxdf.rho, dtype=float), calo_params)
-    charge = charge * sbnd_reco_factor(charge, phi, plane)
-    if not isMC:
-        return charge
-    charge = charge * sbnd_absorbing_factor(charge, phi, np.asarray(dqdxdf.efield, dtype=float),
-                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
-    charge = charge * sbnd_saturation_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
-                                             itpc, plane)
+    charge = charge * sbnd_charge_turnon_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
+                                                itpc, plane)
     return charge
 
 
