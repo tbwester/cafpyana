@@ -528,8 +528,9 @@ def sbnd_amplification(charge, phi, efield, density, calo_params, step=0.01):
     dE/dx amplitude by it per hit is what makes `SBND_MC_NOISE` deliver a CONSTANT fractional
     dE/dx width -- see the comment on that block.
 
-    USES INDEX 0, WHICH IS MC.  `dedx()` below picks `[0] if isMC else [1]` and that is the
-    convention: slot 0 is the MC ModBox set, slot 1 is data's.  This function shipped with `[1]`
+    USES INDEX 0, WHICH IS MC.  Slot 0 is the MC ModBox set and slot 1 is data's.  `dedx()` below
+    now uses slot 0 for BOTH samples -- one inversion, MC's ModBox, CALO.143 -- so this function
+    agreeing with it is no longer a per-sample question.  This function shipped with `[1]`
     while its docstring claimed index 1 was MC -- so an MC-only correction was being scaled by
     DATA's recombination, ~1% out in the amplification and straight through to the applied
     amplitude.  It never reached a product because the dE/dx basis it was written for was
@@ -823,9 +824,31 @@ def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale
             calo_params = new_calo_params
 
         scalegain = calo_params['c_cal_frac'][plane]
-        this_alpha_emb = calo_params["alpha_emb"][0] if isMC else calo_params["alpha_emb"][1]
-        this_beta_90 = calo_params["beta_90"][0] if isMC else calo_params["beta_90"][1]
-        this_R_emb = calo_params["R_emb"][0] if isMC else calo_params["R_emb"][1]
+        # ONE INVERSION, MC's ModBox, FOR BOTH SAMPLES -- the second half of kaonana CALO.143,
+        # which decided "MC's ModBox, one inversion, `absorb` retired".  Only the retirement was
+        # ported; this is the rest.  Slot 0 is MC's set (see `sbnd_amplification`).
+        #
+        # `absorbing_factor` is `R_MC(Rinv_data(q)) / q`, so `Rinv_MC(absorb * q) == Rinv_data(q)`
+        # identically -- verified to 1.33e-15 on 97,415 real hits.  So while `absorb` was applied MC
+        # inverted *effectively* with DATA's ModBox and data inverted with data's: both against the
+        # decision, equally, and it cancelled in every data/MC ratio.  Retiring `absorb` removed
+        # MC's half of that accident and left the two samples on different recombination models,
+        # with nothing left to cancel.
+        #
+        # Cost of leaving it, measured on control hits: data's dE/dx sits a median 6.0% from where
+        # the decision puts it, and the factor runs 0.96 to 1.09 across angle and charge, CROSSING
+        # 1 -- 0.9992 at phi < 0.5 against 1.0642 at phi > 1.2, and 0.9615 for high-charge hits in
+        # the first band.  NO CHARGE RUNG CAN ABSORB A SIGN-CHANGING ANGULAR FACTOR, which is why
+        # the symptom must not be treated by restoring `reco`: that would pull the median back and
+        # leave the angular residual in place, looking fixed.
+        #
+        # This is also what `plot_calo_chi2pid.py --inversion common` has always done.  With this
+        # patch the chain production runs is the chain the control figures were judged on; without
+        # it they were two different ladders, which is exactly why control-sample agreement did not
+        # transfer to the BDT inputs and how this was found.
+        this_alpha_emb = calo_params["alpha_emb"][0]
+        this_beta_90 = calo_params["beta_90"][0]
+        this_R_emb = calo_params["R_emb"][0]
         this_dqdx = scale*dqdx_v/scalegain
         if calo_chain:
             # The five derived rungs, on the CALIBRATED charge, before the inversion.
