@@ -338,11 +338,11 @@ SBND_SATURATION = {
 #: The correlated smear per (itpc, plane).  MC only, and STOCHASTIC.
 #:
 #: THREE BASES ARE SUPPORTED AND THE KEY NAMES SELECT ONE:
-#:   `amplitude`      -- a fractional CHARGE wobble, used as it stands.
+#:   `amplitude`      -- a fractional CHARGE wobble, used as it stands.        <-- SHIPPED
 #:   `amplitude_dedx` -- a fractional dE/dx wobble, divided by each hit's own
 #:                       `sbnd_amplification` before it is applied.
-#:   `amplitude_dedx` + `power` + `rr0`
-#:                    -- the same, times (rr/rr0)**-power.                     <-- SHIPPED
+#:   `amplitude_dedx` + `power` + `rr0` + `rr_range`
+#:                    -- the same, times (rr/rr0)**-power frozen outside the range.
 #: Give exactly one amplitude key.  Switching basis is a constant-block edit, not a code change.
 #:
 #: WHY THE SHAPE.  kaonana CALO.119/120.  The dE/dx basis fixes the SPECIES dependence -- the control
@@ -353,7 +353,11 @@ SBND_SATURATION = {
 #: is right.  The fitted power is +0.0639 +- 0.0098, shared by all six cells, and the shape it gives
 #: rises 12.5% from rr 19 to 3 cm against the +12.3% CALO.113 measured by an unrelated route.
 #:
-#: *** FLAT dE/dx WAS TRIED AND REVERTED AT CALO.113.  DO NOT SHIP `amplitude_dedx` WITHOUT `power`. ***
+#: *** BOTH dE/dx VARIANTS HAVE BEEN TRIED ON THE ANALYSIS AND BOTH LOST.  FLAT: REVERTED AT CALO.113.
+#: WITH AN rr SHAPE: REVERTED AT CALO.125.  Median `delta` against the uncorrected baseline --
+#: charge -37%/-33%/-54% on kmu/kpi/off-ramp, flat dE/dx -19%/-27%/unchanged, dE/dx+shape
+#: -16%/-11%/-50%.  CALO.113 blamed the missing rr dependence; CALO.120 fitted it explicitly and
+#: CALO.125 found it no better.  That diagnosis was wrong and the cause is still unknown. ***
 #: Flat dE/dx is better on the statistic it is fitted to (the control sample's per-hit width closes 25%
 #: better on the held-out muon leg) and WORSE on the analysis: the kmu BDT inputs went -32% -> -19%
 #: against the uncorrected baseline and kpi -42% -> -27%, with 9 of 16 and 13 of 19 features degrading.
@@ -371,12 +375,12 @@ SBND_SATURATION = {
 #: charge's [1, 1.083, 1.218] and a flat dE/dx's [1, 1, 1].  The charge basis is a working proxy for an
 #: rr dependence nobody has fitted.
 SBND_MC_NOISE = {
-    (0, 0): dict(amplitude_dedx=0.0750281, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.7534),
-    (0, 1): dict(amplitude_dedx=0.0890333, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.67),
-    (0, 2): dict(amplitude_dedx=0.0592533, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.7063),
-    (1, 0): dict(amplitude_dedx=0.0693117, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5696),
-    (1, 1): dict(amplitude_dedx=0.0889418, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5629),
-    (1, 2): dict(amplitude_dedx=0.0587694, power=0.0638679, rr0=10, rr_range=(2, 26), length_cm=0.5786),
+    (0, 0): dict(amplitude=0.0490709, length_cm=0.7534),
+    (1, 0): dict(amplitude=0.0457291, length_cm=0.5696),
+    (0, 1): dict(amplitude=0.0580706, length_cm=0.6700),
+    (1, 1): dict(amplitude=0.0583289, length_cm=0.5629),
+    (0, 2): dict(amplitude=0.0389311, length_cm=0.7063),
+    (1, 2): dict(amplitude=0.0384605, length_cm=0.5786),
 }
 
 #: The smallest fraction of its own charge a smeared hit may keep.  At these amplitudes it
@@ -438,11 +442,22 @@ def sbnd_saturation_factor(charge, pitch, itpc, plane):
         if block is None:
             continue
         rows = itpc == tpc
-        bounded = np.minimum(np.where(charge[rows] > 0.0, charge[rows], 0.0), block["q_max"])
+        # `b3` is the pitch tilt's own deposition dependence (CALO.132).  It multiplies an
+        # UNCLIPPED ln(q/knee), which runs to -inf as the charge falls, so a ramped block is
+        # frozen at the BOTTOM as well -- q_max's reason in the other direction.  The two keys
+        # travel together; b3 without q_min would apply an unbounded tilt to a small hit.
+        ramp = block.get("b3", 0.0)
+        floor = float(block.get("q_min", 0.0))
+        if ramp and not floor > 0.0:
+            raise ValueError("a saturation block with b3 needs a positive q_min (CALO.133)")
+        bounded = np.clip(np.where(charge[rows] > 0.0, charge[rows], floor),
+                          floor, block["q_max"])
         with np.errstate(divide="ignore"):
-            above = np.maximum(0.0, np.log(bounded / block["knee"]))
+            ratio = np.log(bounded / block["knee"])
+        above = np.maximum(0.0, ratio)
+        slope = block["b2"] + ramp * ratio
         out[rows] = np.exp(block["b0"] + block["b1"] * above
-                           + block["b2"] * np.log(pitch[rows] / block["p0"]))
+                           + slope * np.log(pitch[rows] / block["p0"]))
     return out
 
 
@@ -520,6 +535,36 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
     (divided per hit by `sbnd_amplification`), optionally with `power`/`rr0` for the shipped rr shape.
     See the comment on that block for why, and for what happened when flat dE/dx was tried.
 
+    Two OPTIONAL keys select the heavy-tailed kernel (kaonana CALO.169, `NOISE_V7`):
+
+      `nu`    -- degrees of freedom of a Student-t field.  A per-TRACK inverse-chi2 scale on the
+                 correlated Gaussian, which is the only construction giving a Student marginal while
+                 leaving the within-track correlation intact: a per-hit draw destroys the correlation,
+                 one draw for the sample merely rescales it.
+      `knee`  -- charge below which a hit is NOT smeared, e/cm.  Absent, every hit is smeared, which
+                 is the shipped behaviour.
+
+    A block carrying `nu` is applied as `exp(amplitude * field)`, not `1 + amplitude * field`.  That is
+    REQUIRED: at nu = 5 the field has occasional large excursions and the additive form would drive
+    them into SBND_CHARGE_FLOOR or negative, while the exponential is positive by construction and
+    median-preserving -- which is what stops the rung injecting a level and colliding with the turn-on
+    (kaonana CALO.149).  Blocks WITHOUT `nu` keep the additive form exactly, so nothing shipped moves.
+
+    TWO THINGS TO CHECK BEFORE TRUSTING A REPROCESSING THAT USES THESE KEYS.
+
+    (1) THE KNEE IS EVALUATED ON THE CHARGE THIS FUNCTION IS GIVEN.  `sbnd_calo_chain` calls the smear
+        last, so that is the POST-SATURATION charge, while kaonana fitted `v7` in its own smear-first
+        order where the knee sees the calibrated charge before the turn-on.  The two differ by the reco
+        and saturation factors, so a knee ported as a bare number is evaluated in the wrong variable --
+        the same defect class as section 3(c) of docs/calo_reprocessing.md.
+
+    (2) THE SEED CONVENTIONS DIFFER ON PURPOSE.  This function mixes the cell into the seed, kaonana
+        uses one seed for every cell.  So the two produce the same DISTRIBUTION and different
+        REALISATIONS, and a hit-for-hit comparison only means something with the conventions aligned.
+        sandbox_lowvar/port_student.py aligns them and agrees to 2e-16 on all six cells; that validates
+        the construction -- field ordering, per-track scale, gate, exponential form -- and nothing about
+        the streams.
+
     THE SEED MUST BE DERIVED FROM THE DATA, NOT FROM A STREAM.  A running counter would make
     a product depend on the order its inputs were read: two passes over the same flatcafs in
     a different order would disagree, and nothing would complain.  The caller passes a hash
@@ -536,6 +581,20 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
         cell_seed = (int(seed) ^ (int(tpc) << 8) ^ (int(plane) << 16)) & 0x7FFFFFFF
         field = sbnd_correlated_field(np.asarray(rr)[rows], np.asarray(track_id)[rows],
                                       block["length_cm"], cell_seed)
+        nu = block.get("nu")
+        if nu is not None:
+            # One draw per TRACK, indexed by FIRST APPEARANCE -- not by the sorted order the field
+            # recursion uses.  Getting this ordering wrong is how the port first disagreed with
+            # kaonana by a factor 2.3: the recursion consumes one normal per hit in sorted order, so
+            # any permutation of the sort permutes the noise.  Vectorised; a dict lookup per hit is
+            # not affordable at reprocessing scale.
+            keys = np.asarray(track_id)[rows]
+            _, first_index, inverse = np.unique(keys, return_index=True, return_inverse=True)
+            rank = np.empty(len(first_index), dtype=int)
+            rank[np.argsort(first_index)] = np.arange(len(first_index))
+            codes = rank[inverse]
+            draws = np.random.default_rng(cell_seed + 77).chisquare(nu, size=len(first_index))
+            field = field * np.sqrt(nu / draws)[codes]
         if "amplitude" in block:
             amplitude = block["amplitude"]
         elif "amplitude_dedx" in block:
@@ -554,7 +613,14 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
         else:
             raise KeyError(f"SBND_MC_NOISE[{int(tpc)}, {int(plane)}] has neither "
                            "`amplitude` (charge) nor `amplitude_dedx`")
-        out[rows] = np.maximum(1.0 + amplitude * field, SBND_CHARGE_FLOOR)
+        knee = block.get("knee")
+        if knee is not None:
+            # Gated on the charge as it arrives; see (1) in the docstring on which charge that is.
+            amplitude = np.where(np.asarray(charge, dtype=float)[rows] >= float(knee), amplitude, 0.0)
+        if nu is not None:
+            out[rows] = np.exp(amplitude * field)
+        else:
+            out[rows] = np.maximum(1.0 + amplitude * field, SBND_CHARGE_FLOOR)
     return out
 
 
