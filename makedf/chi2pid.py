@@ -375,7 +375,33 @@ SBND_SATURATION = {
 #: that rises with it, and that is the shape the data wants -- needed [1, 1.089, 1.123] against
 #: charge's [1, 1.083, 1.218] and a flat dE/dx's [1, 1, 1].  The charge basis is a working proxy for an
 #: rr dependence nobody has fitted.
+#: THE CONSTANTS THE KERNEL KEYS ADDED BY cafpyana_sbnd_calo_student.patch NEED.  That patch taught
+#: this function to READ `nu` and `knee`; without them here the chain silently ran the Gaussian with
+#: no knee -- which is the "a patch with only the code" mirror of the defect section 3 warns about.
+#:
+#: `nu` = 5 and `knee` = 5.6e4 from kaonana CALO.169 (`NOISE_V7`), amplitudes from the same fit.  Six
+#: independent planes; the fitted amplitude over the previously shipped one runs 0.962 to 1.044, three
+#: cells inside 0.3%, at pull-shape chi2/bin 0.70-1.06.  So the 11-28% by which kaonana's GAUSSIAN
+#: amplitudes exceeded these was a Gaussian artefact -- a Gaussian must over-widen the core to reach a
+#: given total width -- and not a deficit in what shipped.
+#:
+#: `length_cm` IS DELIBERATELY LEFT AT THE PREVIOUSLY MEASURED PER-CELL VALUES, not replaced by the
+#: 0.679 the amplitudes were fitted at.  Those are a measurement and this fit is not a reason to
+#: discard them.  The induced inconsistency is bounded and small: across the full 0.5629-0.7534 spread
+#: the amplitude a fixed achieved width needs moves by 0.85-0.89% (CALO.167), because the within-track
+#: projection removes only 4-12% of the field over a 5x length range.  That is inside the amplitude's
+#: own 1-sigma step.  Re-fitting per length would remove it and has not been done.
 SBND_MC_NOISE = {
+    (0, 0): dict(amplitude=0.04719, length_cm=0.7534, nu=5.0, knee=5.6e4),
+    (1, 0): dict(amplitude=0.04772, length_cm=0.5696, nu=5.0, knee=5.6e4),
+    (0, 1): dict(amplitude=0.05820, length_cm=0.6700, nu=5.0, knee=5.6e4),
+    (1, 1): dict(amplitude=0.05825, length_cm=0.5629, nu=5.0, knee=5.6e4),
+    (0, 2): dict(amplitude=0.03900, length_cm=0.7063, nu=5.0, knee=5.6e4),
+    (1, 2): dict(amplitude=0.03970, length_cm=0.5786, nu=5.0, knee=5.6e4),
+}
+
+#: What the amplitudes above replace, kept so the Gaussian configuration stays reproducible.
+SBND_MC_NOISE_GAUSSIAN = {
     (0, 0): dict(amplitude=0.0490709, length_cm=0.7534),
     (1, 0): dict(amplitude=0.0457291, length_cm=0.5696),
     (0, 1): dict(amplitude=0.0580706, length_cm=0.6700),
