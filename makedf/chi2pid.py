@@ -630,6 +630,32 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
     `charge` is the CALIBRATED dQ/dx -- gain, lifetime and YZ already in.  The recombination
     inversion happens after this returns, once.
 
+    THE SMEAR RUNS FIRST, and that is the whole reason this docstring changed.  Two arguments, one
+    physical and one arithmetic:
+
+      physical    the noise is a fluctuation of the CHARGE THAT WAS COLLECTED, while `reco`,
+                  `absorb` and `saturation` all model something that happened to it downstream.
+                  MC's missing noise therefore belongs before them (kaonana CALO.148, which settled
+                  the same question against the turn-on and measured the order at 4.5-5.6% on the
+                  high half of the two innermost proton bands, under 0.3% elsewhere).
+      arithmetic  `sbnd_smear_factor`'s `knee` is a threshold in CHARGE, and kaonana fitted it on the
+                  calibrated charge.  Called last, this function received the post-saturation charge,
+                  so a knee of 5.6e4 gated at ~5.3e4 calibrated -- inside the MIP core rather than at
+                  its top edge, which is exactly the region the knee exists to keep the kernel out of.
+                  Re-expressing the knee in the received basis does NOT fix it: the pre-smear factor
+                  at fixed charge spans +4.5%/-7.66% across real hits (varying with phi through
+                  `reco`, with pitch through `saturation`, and with field and density through
+                  `absorb`), so one adjusted number leaves a per-hit misplacement the size of the
+                  original error.  Running first, the smear sees the calibrated charge and the fitted
+                  knee is already in the right basis.  `sbnd_level_scale` is 1.0 for MC, so nothing
+                  stands between the input and the gate.
+
+    ONE CONSEQUENCE FOR THE dE/dx AMPLITUDE BASIS.  `amplitude_dedx` blocks divide by
+    `sbnd_amplification` evaluated at the hit's charge, which is now the calibrated charge rather
+    than the post-saturation one.  `SBND_MC_NOISE` ships `amplitude` (charge basis), so nothing in
+    use is affected -- but that path exists and both dE/dx bases have been tried and lost (CALO.113,
+    CALO.125), so re-deriving before using one is required anyway.
+
     The FITTED blocks are held at their nominal values in every calo universe, so each
     variation is a variation about the corrected central value, which is what a covariance
     built from them assumes.  `absorb` is the exception and uses each universe's own
@@ -639,14 +665,9 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
     itpc = np.asarray(dqdxdf.tpc)
     phi = np.asarray(dqdxdf.phi, dtype=float)
     charge = charge * sbnd_level_scale(itpc, plane, isMC=isMC)
-    charge = charge * sbnd_reco_factor(charge, phi, plane)
-    if not isMC:
-        return charge
-    charge = charge * sbnd_absorbing_factor(charge, phi, np.asarray(dqdxdf.efield, dtype=float),
-                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
-    charge = charge * sbnd_saturation_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
-                                             itpc, plane)
-    if smear:
+    # The smear, on the CALIBRATED charge -- see the docstring.  MC only, so it is guarded here
+    # rather than relying on the `not isMC` return below, now placed after it.
+    if isMC and smear:
         levels = list(range(dqdxdf.index.nlevels - 1))
         track = (np.asarray(dqdxdf.index.droplevel(-1).to_numpy()) if levels
                  else np.zeros(len(charge), dtype=int))
@@ -654,6 +675,13 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
                                             itpc, plane, seed, charge, phi,
                                             np.asarray(dqdxdf.efield, dtype=float),
                                             np.asarray(dqdxdf.rho, dtype=float), calo_params)
+    charge = charge * sbnd_reco_factor(charge, phi, plane)
+    if not isMC:
+        return charge
+    charge = charge * sbnd_absorbing_factor(charge, phi, np.asarray(dqdxdf.efield, dtype=float),
+                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
+    charge = charge * sbnd_saturation_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
+                                             itpc, plane)
     return charge
 
 
