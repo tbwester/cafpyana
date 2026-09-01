@@ -675,23 +675,43 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
 #: (0.9399 +- 0.0039); `ref_level` is decisively per-cell.  A log-linear alternative -- which is what
 #: `sbnd_reco_factor` is -- loses in ALL SIX at chi2/dof up to 3.353 against 1.272, with the
 #: curvature significant at 2.4-8.1 sigma.  That is why `reco` is not a substitute for this rung.
+#: *** THESE ARE `TURNON_V5`, DERIVED ON THE LEVELLED CHARGE.  kaonana CALO.172. ***
+#:
+#: `TURNON_V4`'s `ref_level` was fitted with the `level` rung TABLED, and this chain applies the
+#: level.  Running both applied one measurement twice -- the double-count kaonana CALO.145 named
+#: `ref_level` to prevent -- and it was worth a flat -0.60% data/MC in dE/dx on plane 2, which is
+#: exactly the residual CALO.171 booked as open.
+#:
+#: Only `ref_level` differs from `TURNON_V4`, by exactly `ln(level)` per cell.  `depth`, `b2`,
+#: `knee`, `s`, `q_min`, `q_max` and the pitch window are bit-identical.  That is algebra, not a
+#: refit: the level scales data's charge by a constant per cell, hence the data/MC ratio the turn-on
+#: is fitted to by the same constant, uniformly in charge and in pitch -- and a uniform
+#: multiplicative shift in the target lands entirely in a log-linear model's additive constant.
+#: Refitting against both charges moves `depth` by <=1.1e-16.
+#:
+#: DO NOT pair these with a chain that omits `sbnd_level_scale`, and do not restore `TURNON_V4`
+#: without also removing the level.  The two valid configurations are (V5, level on) -- this one --
+#: and (V4, level off), which is what `calo_ladder.apply_ladder` runs and which is equivalent to it.
+#: `test_the_two_valid_turnon_level_pairings_are_the_same_chain` pins that on all six cells.  Either
+#: mismatch is a silent 0.6% level error on plane 2 and 3.6% on (1, 0).
+#:
 SBND_CHARGE_TURNON = {
-    (0, 0): dict(ref_level=0.014, depth=0.94684, b2=-0.03498,
+    (0, 0): dict(ref_level=0.002244, depth=0.94684, b2=-0.03498,
                  knee=227670.5, s=0.09487, q_min=50939.0, q_max=266493.0,
                  pitch_min=0.3, pitch_max=1.6),
-    (0, 1): dict(ref_level=0.00803, depth=0.93795, b2=-0.01225,
+    (0, 1): dict(ref_level=0.003328, depth=0.93795, b2=-0.01225,
                  knee=171238.2, s=0.05335, q_min=51504.0, q_max=260261.0,
                  pitch_min=0.3, pitch_max=1.7),
-    (0, 2): dict(ref_level=-0.00047, depth=0.93043, b2=-0.02415,
+    (0, 2): dict(ref_level=-0.000739, depth=0.93043, b2=-0.02415,
                  knee=207591.1, s=0.08215, q_min=50089.0, q_max=265293.0,
                  pitch_min=0.3, pitch_max=0.75),
-    (1, 0): dict(ref_level=0.03653, depth=0.94348, b2=-0.0276,
+    (1, 0): dict(ref_level=-0.000589, depth=0.94348, b2=-0.0276,
                  knee=227670.5, s=0.1687, q_min=50908.0, q_max=269680.0,
                  pitch_min=0.3, pitch_max=1.6),
-    (1, 1): dict(ref_level=0.0118, depth=0.94529, b2=-0.01456,
+    (1, 1): dict(ref_level=0.01019, depth=0.94529, b2=-0.01456,
                  knee=231843.2, s=0.25979, q_min=51362.0, q_max=269954.0,
                  pitch_min=0.3, pitch_max=1.7),
-    (1, 2): dict(ref_level=0.01164, depth=0.95079, b2=-0.03231,
+    (1, 2): dict(ref_level=0.002285, depth=0.95079, b2=-0.03231,
                  knee=249334.8, s=0.08215, q_min=50218.0, q_max=261276.0,
                  pitch_min=0.3, pitch_max=0.75),
 }
