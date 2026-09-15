@@ -31,12 +31,15 @@ SBND_CALO_PARAMS = {
         ## Data: the reco2 fcl's own gains, with NOTHING FITTED -- this is "setting F".
         ##
         ## It was [0.0211835, 0.0209689, 0.0205106], i.e. these times a fitted
-        ## plane-independent 0.9753 (V3.51).  That remainder is REMOVED here, because the
-        ## per-(itpc, plane) level in SBND_TPC_PLANE_LEVEL replaces it and was derived
-        ## against setting F's charge.  Leaving the 0.9753 in would make the data charge
-        ## entering sbnd_calo_chain 2.53% larger than the charge the level was measured
-        ## on, so the level would under-correct data by 2.53% on every plane -- silently.
-        ## Do not restore it without re-deriving the level.  CALO.87, CALO.105.
+        ## plane-independent 0.9753 (V3.51).  That remainder is REMOVED here, and now for a
+        ## stronger reason than when it went: NOTHING in this module corrects data's charge
+        ## any more (kaonana CALO.181).  The ladder corrects MC to data, so data's charge is
+        ## whatever these gains produce and every fitted constant downstream was measured
+        ## against it.  Leaving the 0.9753 in would make the data charge entering
+        ## sbnd_calo_chain 2.53% larger than the charge the turn-on's `ref_level` was
+        ## measured on, so MC would be corrected to the wrong level on every plane --
+        ## silently.  Do not restore it without re-deriving SBND_CHARGE_TURNON.
+        ## CALO.87, CALO.105, CALO.181.
         [0.02172, 0.02150, 0.02103]], ## Data
     "c_cal_frac": [1., 1., 1.],
     "etau": [35., 35.], ## first value for MC and second value for data
@@ -260,19 +263,21 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
 ##############################
 # THE SBND CALORIMETRY CHAIN (derived by kaonana.calo, CALO.91-CALO.104)
 #
-# Order:  level -> smear -> turnon -> invert.  NOT FREE.
-#   `absorb` is RETIRED (CALO.143) -- see sbnd_calo_chain.
-#   * `level` is a data-side gain, so it acts first, before anything charge-dependent.
-#   * `reco` is a reconstruction defect and applies to BOTH samples.
-#   * `saturation` and `smear` are MC-ONLY.  Applying them to data is not a
-#     bug, it is a wrong measurement.
-#   * the turn-on is a factor on the CALIBRATED charge, so applying it to
-#     the raw charge evaluates the knee in the wrong variable.
-#   * everything acts on CHARGE; recombination is inverted once, at the end.
+# Order:  turnon -> smear -> invert.  NOT FREE.  BOTH RUNGS ARE MC-ONLY.
+#   `absorb` is RETIRED (CALO.143), `reco` and `saturation` are retired (CALO.172)
+#   and the data-side `level` is retired as a rung (CALO.181) -- see sbnd_calo_chain.
+#   * DATA IS NOT CORRECTED AT ALL.  The ladder brings MC's charge to data's, so
+#     data's charge is what the fcl gains produce and nothing here touches it.
+#     Applying an MC rung to data is not a bug, it is a wrong measurement.
+#   * the turn-on acts FIRST (CALO.182) and is a factor on the CALIBRATED charge,
+#     so applying it to the raw charge evaluates its knee in the wrong variable.
+#   * the smear therefore gates on the TURNED-ON charge, which is the basis its
+#     amplitude is derived in for this order.  The two do not commute.
+#   * everything acts on CHARGE; recombination is inverted once, at the end, on
+#     MC's ModBox for both samples.
 #
-# Two of the five carry no fitted numbers at all -- the absorbing factor and the
-# correlated field -- so a patch with only the constant blocks below is wrong by
-# ~5% in dE/dx and will look plausible.
+# One of the two carries no fitted numbers at all -- the correlated field -- so a
+# patch with only the constant blocks below is wrong and will look plausible.
 #
 # See docs/patches/cafpyana_sbnd_calo_chain.patch for what each rung is and why.
 ##############################
@@ -291,9 +296,22 @@ SBND_RECO_CORRECTION = {
     2: dict(q0=130000, a0=0.0289619024, a1=-0.040410619, a2=-0.0427837696),
 }
 
-#: A DATA-side dQ/dx scale per (itpc, plane).  MC is 1.0 by construction: this is a
-#: calibration, not a correction to the simulation.  It cannot live in `gains` or
-#: `c_cal_frac`, which are indexed by plane alone.
+#: A DATA-side dQ/dx scale per (itpc, plane).  *** NO LONGER APPLIED BY `sbnd_calo_chain`
+#: (kaonana CALO.181). *** The offset is real and is still corrected -- by the turn-on's
+#: `ref_level`, which is a free additive constant in log charge and represents a flat scale
+#: exactly.  Measured: re-deriving the turn-on with the level off moves `ref_level` by
+#: precisely -ln(scale) on all six cells and leaves `depth` unmoved (<=1.1e-16), so the two
+#: were never independent parameters and applying both double-counted one measurement.
+#:
+#: The ladder corrects MC's charge to DATA's, so data is left alone; a data-side rung puts
+#: the reference on MC, which is backwards.
+#:
+#: LEFT DEFINED, like `sbnd_absorbing_factor`, because it is still a measurement: it is the
+#: level estimated on its own legs rather than through the turn-on's basis, and comparing the
+#: two is how `ref_level` stays checkable.  `sbnd_level_scale` is the closed form.  What is
+#: wrong is applying it and `SBND_CHARGE_TURNON` together.
+#:
+#: It cannot live in `gains` or `c_cal_frac`, which are indexed by plane alone.
 #:
 #: Almost all of it is (1, 0) at 4.8%, where the proton and stopping-muon legs agree to
 #: 0.07%.  *** (0, 1) is deliberately ~1: *** its two legs disagree at chi2 5.4 on one
@@ -417,7 +435,11 @@ SBND_CHARGE_FLOOR = 0.05
 
 
 def sbnd_level_scale(itpc, plane, isMC=False):
-    """The data-side per-(itpc, plane) dQ/dx scale.  1.0 everywhere for MC."""
+    """The data-side per-(itpc, plane) dQ/dx scale.  1.0 everywhere for MC.
+
+    NOT CALLED BY `sbnd_calo_chain` -- see SBND_TPC_PLANE_LEVEL.  Calling it alongside
+    `sbnd_charge_turnon_factor` applies one measurement twice.
+    """
     itpc = np.asarray(itpc, dtype=int)
     out = np.ones(len(itpc))
     if isMC:
@@ -580,11 +602,14 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
 
     TWO THINGS TO CHECK BEFORE TRUSTING A REPROCESSING THAT USES THESE KEYS.
 
-    (1) THE KNEE IS EVALUATED ON THE CHARGE THIS FUNCTION IS GIVEN.  `sbnd_calo_chain` calls the smear
-        last, so that is the POST-SATURATION charge, while kaonana fitted `v7` in its own smear-first
-        order where the knee sees the calibrated charge before the turn-on.  The two differ by the reco
-        and saturation factors, so a knee ported as a bare number is evaluated in the wrong variable --
-        the same defect class as section 3(c) of docs/calo_reprocessing.md.
+    (1) THE KNEE IS EVALUATED ON THE CHARGE THIS FUNCTION IS GIVEN, so it means nothing without
+        knowing the chain's rung ORDER.  `sbnd_calo_chain` now calls the smear after the turn-on
+        (kaonana CALO.182), so that is the TURNED-ON charge, and kaonana's derivation gates on the
+        same quantity when run in the same order -- `noise.derive_amplitude(order="turnon")`, which
+        the constants sidecar records per cell.  A knee ported as a bare number from a derivation in
+        the OTHER order is evaluated in the wrong variable; that is the defect class section 3(c) of
+        docs/calo_reprocessing.md describes, and matching the orders is the only fix -- adjusting the
+        number is not, because the pre-smear factor varies per hit.
 
     (2) THE SEED CONVENTIONS DIFFER ON PURPOSE.  This function mixes the cell into the seed, kaonana
         uses one seed for every cell.  So the two produce the same DISTRIBUTION and different
@@ -675,43 +700,51 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
 #: (0.9399 +- 0.0039); `ref_level` is decisively per-cell.  A log-linear alternative -- which is what
 #: `sbnd_reco_factor` is -- loses in ALL SIX at chi2/dof up to 3.353 against 1.272, with the
 #: curvature significant at 2.4-8.1 sigma.  That is why `reco` is not a substitute for this rung.
-#: *** THESE ARE `TURNON_V5`, DERIVED ON THE LEVELLED CHARGE.  kaonana CALO.172. ***
+#: *** THESE ARE `TURNON_V4`, DERIVED ON THE BARE CALIBRATED CHARGE WITH NO LEVEL RUNG.
+#: kaonana CALO.181. ***  `ref_level` carries the flat per-cell offset, which is why this chain
+#: no longer calls `sbnd_level_scale` -- see SBND_TPC_PLANE_LEVEL.
 #:
-#: `TURNON_V4`'s `ref_level` was fitted with the `level` rung TABLED, and this chain applies the
-#: level.  Running both applied one measurement twice -- the double-count kaonana CALO.145 named
-#: `ref_level` to prevent -- and it was worth a flat -0.60% data/MC in dE/dx on plane 2, which is
-#: exactly the residual CALO.171 booked as open.
+#: `TURNON_V5` is these blocks with `ref_level` shifted by `+ln(level)`, and it belongs with a chain
+#: that applies the level.  Only `ref_level` differs; `depth`, `b2`, `knee`, `s`, `q_min`, `q_max`
+#: and the pitch window are bit-identical between the two.  That is algebra, not a refit: the level
+#: scales data's charge by a constant per cell, hence the data/MC ratio the turn-on is fitted to by
+#: the same constant, uniformly in charge and in pitch -- and a uniform multiplicative shift in the
+#: target lands entirely in a log-linear model's additive constant.  Refitting against both charges
+#: moves `depth` by <=1.1e-16.
 #:
-#: Only `ref_level` differs from `TURNON_V4`, by exactly `ln(level)` per cell.  `depth`, `b2`,
-#: `knee`, `s`, `q_min`, `q_max` and the pitch window are bit-identical.  That is algebra, not a
-#: refit: the level scales data's charge by a constant per cell, hence the data/MC ratio the turn-on
-#: is fitted to by the same constant, uniformly in charge and in pitch -- and a uniform
-#: multiplicative shift in the target lands entirely in a log-linear model's additive constant.
-#: Refitting against both charges moves `depth` by <=1.1e-16.
+#: DO NOT pair these with a chain that applies `sbnd_level_scale`, and do not restore `TURNON_V5`
+#: without also restoring the level.  The two valid configurations are (V4, level off) -- this one,
+#: and what `kaonana.calo.ladder.ladder_frame` runs -- and (V5, level on), the CALO.102-172 chain.
+#: `test_the_two_valid_turnon_level_pairings_are_the_same_chain` pins them equal on all six cells.
+#: Either mismatch is a silent 0.6% level error on plane 2 and 3.6% on (1, 0), and it is silent
+#: because the two blocks differ in ONE field out of nine.
 #:
-#: DO NOT pair these with a chain that omits `sbnd_level_scale`, and do not restore `TURNON_V4`
-#: without also removing the level.  The two valid configurations are (V5, level on) -- this one --
-#: and (V4, level off), which is what `calo_ladder.apply_ladder` runs and which is equivalent to it.
-#: `test_the_two_valid_turnon_level_pairings_are_the_same_chain` pins that on all six cells.  Either
-#: mismatch is a silent 0.6% level error on plane 2 and 3.6% on (1, 0).
+#: *** THE TWO ARE EQUIVALENT IN THE DATA/MC RATIO, AND NOT ON THE ANALYSIS. ***  That test, and
+#: every check behind it, compares the data/MC CHARGE ratio -- equal to 4.8e-7.  The absolute dQ/dx
+#: differs: swapping the carrier moves BOTH samples by 1/level, +0.03% on (0, 2) to +3.8% on (1, 0).
+#: `dedx`'s chi2 compares each sample against a FIXED template, so that common-mode shift does not
+#: cancel and chi2 is nonlinear in dE/dx besides.  Measured on the analysis (kaonana CALO.186, two
+#: productions on byte-identical file lists): the swap costs the kmu BDT channel 2.15 sigma of median
+#: `delta`, improving 2 of 16 features.  Below the 3-sigma withdrawal line, so it ships -- but do not
+#: quote the 2e-6 as though the configurations were interchangeable downstream of the ratio.
 #:
 SBND_CHARGE_TURNON = {
-    (0, 0): dict(ref_level=0.002244, depth=0.94684, b2=-0.03498,
+    (0, 0): dict(ref_level=0.01400, depth=0.94684, b2=-0.03498,
                  knee=227670.5, s=0.09487, q_min=50939.0, q_max=266493.0,
                  pitch_min=0.3, pitch_max=1.6),
-    (0, 1): dict(ref_level=0.003328, depth=0.93795, b2=-0.01225,
+    (0, 1): dict(ref_level=0.00803, depth=0.93795, b2=-0.01225,
                  knee=171238.2, s=0.05335, q_min=51504.0, q_max=260261.0,
                  pitch_min=0.3, pitch_max=1.7),
-    (0, 2): dict(ref_level=-0.000739, depth=0.93043, b2=-0.02415,
+    (0, 2): dict(ref_level=-0.00047, depth=0.93043, b2=-0.02415,
                  knee=207591.1, s=0.08215, q_min=50089.0, q_max=265293.0,
                  pitch_min=0.3, pitch_max=0.75),
-    (1, 0): dict(ref_level=-0.000589, depth=0.94348, b2=-0.0276,
+    (1, 0): dict(ref_level=0.03653, depth=0.94348, b2=-0.0276,
                  knee=227670.5, s=0.1687, q_min=50908.0, q_max=269680.0,
                  pitch_min=0.3, pitch_max=1.6),
-    (1, 1): dict(ref_level=0.01019, depth=0.94529, b2=-0.01456,
+    (1, 1): dict(ref_level=0.01180, depth=0.94529, b2=-0.01456,
                  knee=231843.2, s=0.25979, q_min=51362.0, q_max=269954.0,
                  pitch_min=0.3, pitch_max=1.7),
-    (1, 2): dict(ref_level=0.002285, depth=0.95079, b2=-0.03231,
+    (1, 2): dict(ref_level=0.01164, depth=0.95079, b2=-0.03231,
                  knee=249334.8, s=0.08215, q_min=50218.0, q_max=261276.0,
                  pitch_min=0.3, pitch_max=0.75),
 }
@@ -756,30 +789,36 @@ def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
 
 
 def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True):
-    """The five rungs, in the only order that is right.  Returns CORRECTED CHARGE.
+    """TWO MC RUNGS, turn-on then smear.  DATA IS NOT TOUCHED.  Returns CORRECTED CHARGE.
 
     `charge` is the CALIBRATED dQ/dx -- gain, lifetime and YZ already in.  The recombination
-    inversion happens after this returns, once.
+    inversion happens after this returns, once, on MC's ModBox for both samples.
 
-    THE SMEAR RUNS FIRST, and that is the whole reason this docstring changed.  Two arguments, one
-    physical and one arithmetic:
+    NOTHING HERE CORRECTS DATA (kaonana CALO.181).  The ladder's job is to bring MC's charge to
+    data's, so data's charge is whatever the fcl gains produce -- setting F, nothing fitted -- and
+    every constant in this module was measured against that.  `sbnd_level_scale` used to run on data
+    before the early return and does not any more; its offset is carried by `SBND_CHARGE_TURNON`'s
+    `ref_level`, and applying both applied one measurement twice.  A data-side rung also puts the
+    reference on MC, which is backwards: MC is the thing being corrected.
 
-      physical    the noise is a fluctuation of the CHARGE THAT WAS COLLECTED, while `reco`,
-                  `absorb` and `saturation` all model something that happened to it downstream.
-                  MC's missing noise therefore belongs before them (kaonana CALO.148, which settled
-                  the same question against the turn-on and measured the order at 4.5-5.6% on the
-                  high half of the two innermost proton bands, under 0.3% elsewhere).
-      arithmetic  `sbnd_smear_factor`'s `knee` is a threshold in CHARGE, and kaonana fitted it on the
-                  calibrated charge.  Called last, this function received the post-saturation charge,
-                  so a knee of 5.6e4 gated at ~5.3e4 calibrated -- inside the MIP core rather than at
-                  its top edge, which is exactly the region the knee exists to keep the kernel out of.
-                  Re-expressing the knee in the received basis does NOT fix it: the pre-smear factor
-                  at fixed charge spans +4.5%/-7.66% across real hits (varying with phi through
-                  `reco`, with pitch through `saturation`, and with field and density through
-                  `absorb`), so one adjusted number leaves a per-hit misplacement the size of the
-                  original error.  Running first, the smear sees the calibrated charge and the fitted
-                  knee is already in the right basis.  `sbnd_level_scale` is 1.0 for MC, so nothing
-                  stands between the input and the gate.
+    THE TURN-ON RUNS FIRST (kaonana CALO.182), reversing the CALO.148 order this function shipped
+    with.  CALO.148 measured the order against a chain that had `reco`, `absorb` and `saturation`
+    in it; all three are retired, so its arithmetic argument is about rungs that no longer exist.
+    Re-measured on the surviving pair -- amplitude refitted IN each order, paired track bootstrap --
+    smear-first always leaves MC's high half narrower than data's, and in the one `rr` band where
+    either order differs from 1 turn-on-first is closer on both plane-2 cells.
+
+    THE KNEE'S BASIS IS THE ONE THING TO CHECK WHEN THIS ORDER CHANGES.  `sbnd_smear_factor`'s
+    `knee` is a threshold in CHARGE, so it is evaluated in whatever basis this function hands it --
+    the turned-on charge now, the bare calibrated charge before.  That is not a defect here because
+    kaonana derives the amplitude in the SAME order it is applied (`noise.derive_amplitude(order=)`,
+    and the sidecar records which); re-deriving in the decided order leaves the shipped `NOISE_V7`
+    amplitude the on-grid minimum for 10 of the 12 (cell, leg) pairs.  What it does do is move which
+    hits are gated: the turn-on factor at the knee is 1.003-1.035, so 0.7-4.8% of MC hits per cell
+    cross the 5.6e4 gate that did not before.  Measured, that population is the whole difference
+    between the orders -- hits whose gate state holds move by <=0.5% at the 1/99 percentiles, while
+    the flipped ones span 0.82-1.22 because the entire kernel factor appears or disappears.  An
+    amplitude taken from a smear-first derivation and applied here is therefore NOT the same rung.
 
     ONE CONSEQUENCE FOR THE dE/dx AMPLITUDE BASIS.  `amplitude_dedx` blocks divide by
     `sbnd_amplification` evaluated at the hit's charge, which is now the calibrated charge rather
@@ -814,13 +853,15 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
     charge = np.asarray(charge, dtype=float)
     itpc = np.asarray(dqdxdf.tpc)
     phi = np.asarray(dqdxdf.phi, dtype=float)
-    charge = charge * sbnd_level_scale(itpc, plane, isMC=isMC)
-    # Everything past here is MC-only, so data leaves now.  The early return moved up from below
-    # `reco` when `reco` was dropped, which is what makes the guard on the smear unnecessary.
+    # EVERY rung is MC-only, so data leaves untouched and this return is the whole data path.
     if not isMC:
         return charge
-    # The smear FIRST, on the calibrated charge -- see the docstring.  With `reco` gone there is
-    # nothing at all between the input and the gate, so the fitted knee is exactly in its own basis.
+    # The TURN-ON first -- see the docstring.  It is a deterministic function of the calibrated
+    # charge and the pitch, so it is the rung that can be ordered by argument rather than by draw.
+    charge = charge * sbnd_charge_turnon_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
+                                                itpc, plane)
+    # Then the smear, which therefore gates on the TURNED-ON charge.  That is the basis kaonana
+    # derives the amplitude in for this order; it is not a free choice here.
     if smear:
         levels = list(range(dqdxdf.index.nlevels - 1))
         track = (np.asarray(dqdxdf.index.droplevel(-1).to_numpy()) if levels
@@ -829,8 +870,6 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
                                             itpc, plane, seed, charge, phi,
                                             np.asarray(dqdxdf.efield, dtype=float),
                                             np.asarray(dqdxdf.rho, dtype=float), calo_params)
-    charge = charge * sbnd_charge_turnon_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
-                                                itpc, plane)
     return charge
 
 
