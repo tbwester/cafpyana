@@ -1,4 +1,6 @@
 from . import calo
+import os
+
 import pandas as pd
 import numpy as np
 import sqlite3
@@ -650,6 +652,28 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
             field = field * np.sqrt(nu / draws)[codes]
         if "amplitude" in block:
             amplitude = block["amplitude"]
+            if "q_power" in block:
+                # A CHARGE power law on the amplitude, read on the charge AS IT ARRIVES -- the same
+                # quantity the knee reads, so the two cannot disagree about which charge they mean.
+                #
+                # The amplitude is NOT flat in charge: kaonana's primer measures it falling as
+                # (dQ/dx)^-0.34 +- 0.05, six cells consistent, 6.8 sigma from flat, and forward-
+                # matching the structure function per deposition band rejects a constant on 6/6
+                # cells at chi2/dof 14-40 (kaonana CALO.197).  `q0` is the median arriving charge of
+                # the hits chi2pid scores, so this is a pure SHAPE rotation about the population's
+                # centre and the fitted `amplitude` is still the amplitude there.
+                #
+                # `q_power` is the SIGNED exponent.  NOTE this is the opposite convention to the `rr`
+                # shape's `power` key below, which stores a positive number applied as `** -power`.
+                # The sign is the thing that would silently invert the correction, so the two are
+                # spelled out rather than shared.
+                #
+                # FROZEN outside `q_range`, for the same reason as the rr shape: production smears
+                # every hit including the sub-MIP ones the derivation never saw, and an unfrozen
+                # power law diverges as q -> 0.  The range is the primer's own fitted range.
+                q_low, q_high = block.get("q_range", (5.0e4, 2.0e5))
+                q_clipped = np.clip(np.asarray(charge, dtype=float)[rows], q_low, q_high)
+                amplitude = amplitude * (q_clipped / block["q0"]) ** block["q_power"]
         elif "amplitude_dedx" in block:
             if amplification is None:
                 amplification = sbnd_amplification(charge, phi, efield, density, calo_params)
@@ -752,6 +776,85 @@ SBND_CHARGE_TURNON = {
 #: The anchors `depth` is defined on.  Constants, not tunables -- see SBND_CHARGE_TURNON.
 SBND_TURNON_ANCHORS = dict(q_low=60000.0, q_ref=120000.0, q_high=240000.0, p0=0.42)
 
+# ---------------------------------------------------------------------------------------------------
+# THE JOINT ALTERNATIVE (kaonana CALO.192), FOR E4 ONLY.  NOT THE SHIPPED CHAIN.
+#
+# One FLAT level and one smear amplitude per (tpc, plane), fitted TOGETHER against data/MC
+# disagreement in the two distributions chi2 PID is made of -- the signed per-track `<pull>` and the
+# per-track `Var(pull)`.  It replaces the softplus turn-on entirely; there is no charge dependence
+# left in the level rung.
+#
+# WHY IT IS HERE AT ALL: a joint fit has no rung ORDER, so "a rung must be derived in the order it
+# is applied" -- worth 3.1-4.4% between the two orders and 13-21% against leaving the upstream rung
+# out (kaonana CALO.153) -- stops being a question that can be got wrong.  Out of sample it reaches
+# parity with the shipped chain (+2.0% of test chi2, 3 cells better and 3 worse) on TWO parameters
+# per cell instead of four, with both stable to <=1.8x their claimed error.
+#
+# WHAT IT GIVES UP, measured and not assumed: the inner-`rr` charge deficit.  A flat level cannot
+# follow a 21% deficit that is a function of `rr`, so `calo_sel_charge`'s innermost proton bin stays
+# at 0.78-0.89 where the softplus lifts it to 0.92-0.95.  That costs 0.8-1.4 percentage points on a
+# median-placed chi2_proton cut against 2.4-3.1 from the amplitude's own uncertainty, i.e. it is
+# SUB-DOMINANT and bookable (kaonana CALO.192's follow-ups).
+#
+# ADOPTED AT kaonana CALO.197, so this is now the chain, unconditionally.  It was selected by
+# `KAONANA_CALO_JOINT=1` while it was a candidate; that switch is GONE, because it failed silently --
+# a production against an unset switch scored the shipped chain and nothing complained, which is what
+# `sandbox_jointfit/check_production.py` had to exist to catch.
+# ---------------------------------------------------------------------------------------------------
+
+#: Flat per-cell level, `form="flat"`.  `form` is what makes the softplus blocks above keep
+#: evaluating the old way; a global switch would silently re-interpret every number in the arc.
+SBND_CHARGE_TURNON_JOINT = {
+    (0, 0): dict(form="flat", level=1.0065725492188893),
+    (1, 0): dict(form="flat", level=1.0365785991474963),
+    (0, 1): dict(form="flat", level=1.0056342623343753),
+    (1, 1): dict(form="flat", level=1.018320956011673),
+    (0, 2): dict(form="flat", level=0.9984753724676564),
+    (1, 2): dict(form="flat", level=1.0138893272262512),
+}
+
+#: `SBND_MC_NOISE` with each cell's amplitude multiplied by its jointly fitted scale,
+#: carried at FULL precision: the verification asserts exact agreement, and five
+#: decimals disagrees at 5e-6, which is a tolerance rather than a check.  Length, `nu`
+#: and `knee` are UNCHANGED -- only the amplitude was scanned, and the knee still gates on the
+#: charge as it arrives, which is now the levelled charge.
+#
+# CHARGE SHAPE, kaonana CALO.197.  `q_power` = -0.34 is the primer's measured exponent
+# ((dQ/dx)^-0.34 +- 0.05, six cells consistent, 6.8 sigma from flat); `q0` = 1.13e5 is the median
+# ARRIVING charge of the hits chi2pid scores (111.3-116.1 ke/cm across the six cells), so this is a
+# pure shape rotation about the population's centre and the fitted `amplitude` above is still the
+# amplitude there -- verified: the pull objective moves by 0.1-0.6 of its own seed spread, and MC's
+# median by <=0.18% against the knee's 1.4-2.4%.  `q_range` is the primer's fitted range and the law
+# is frozen outside it.  THE JOINT PATCH ALONE REPRODUCES THE FLAT ARM (dfs_joint); this block with
+# the shape keys is the shaped arm, and the two differ by exactly one change (E4's rule).
+SBND_MC_NOISE_JOINT = {
+    (0, 0): dict(amplitude=0.0438957052179971, length_cm=0.7534, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+    (1, 0): dict(amplitude=0.047775851480312895, length_cm=0.5696, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+    (0, 1): dict(amplitude=0.056945429421762624, length_cm=0.67, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+    (1, 1): dict(amplitude=0.06046722470427091, length_cm=0.5629, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+    (0, 2): dict(amplitude=0.043005168373573, length_cm=0.7063, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+    (1, 2): dict(amplitude=0.03988776611977357, length_cm=0.5786, nu=5.0, knee=5.6e4,
+                 q_power=-0.34, q0=1.13e5, q_range=(5.0e4, 2.0e5)),
+}
+
+#: What the softplus chain applied, captured under its own name BEFORE the reassignment below so
+#: `dfs_calo185` and every production before CALO.197 stays reproducible: assign these back to
+#: `SBND_CHARGE_TURNON` / `SBND_MC_NOISE` and the old chain returns exactly.
+SBND_CHARGE_TURNON_SOFTPLUS = SBND_CHARGE_TURNON
+SBND_MC_NOISE_V7 = SBND_MC_NOISE
+
+#: **THE SHIPPED CHAIN** (kaonana CALO.197): a flat per-cell level in the turn-on's slot and V7's
+#: amplitudes at production's per-cell lengths with the charge power law.  Unconditional on purpose --
+#: an environment switch that decides which constants a product was made with is a switch that can be
+#: forgotten, and the products this replaced were produced with it set.
+SBND_CHARGE_TURNON = SBND_CHARGE_TURNON_JOINT
+SBND_MC_NOISE = SBND_MC_NOISE_JOINT
+
 
 def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
     """The charge turn-on on MC's charge, frozen outside its fitted charge AND pitch windows.
@@ -772,6 +875,11 @@ def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
         if block is None:
             continue
         rows = itpc == tpc
+        # A `form="flat"` block is the joint fit's level and has no charge or pitch dependence at
+        # all, so none of the freezing below applies to it (kaonana CALO.192).
+        if block.get("form") == "flat":
+            out[rows] = block["level"]
+            continue
         q = np.clip(charge[rows], block["q_min"], block["q_max"])
         p = np.clip(pitch[rows], block["pitch_min"], block["pitch_max"])
         s, knee = block["s"], block["knee"]
