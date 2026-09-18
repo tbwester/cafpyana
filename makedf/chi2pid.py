@@ -580,7 +580,7 @@ def sbnd_amplification(charge, phi, efield, density, calo_params, step=0.01):
 
 
 def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, density,
-                      calo_params):
+                      calo_params, noise=None):
     """The stochastic factor on MC's charge.
 
     Reads whichever amplitude key `SBND_MC_NOISE` carries -- `amplitude` (charge) or `amplitude_dedx`
@@ -629,7 +629,7 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
     out = np.ones(len(np.asarray(rr)))
     amplification = None
     for tpc in np.unique(itpc):
-        block = SBND_MC_NOISE.get((int(tpc), int(plane)))
+        block = (SBND_MC_NOISE if noise is None else noise).get((int(tpc), int(plane)))
         if block is None:
             continue
         rows = itpc == tpc
@@ -688,7 +688,7 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
                 clipped = np.clip(np.asarray(rr, dtype=float)[rows], low, high)
                 amplitude = amplitude * (clipped / block["rr0"]) ** -block["power"]
         else:
-            raise KeyError(f"SBND_MC_NOISE[{int(tpc)}, {int(plane)}] has neither "
+            raise KeyError(f"noise block [{int(tpc)}, {int(plane)}] has neither "
                            "`amplitude` (charge) nor `amplitude_dedx`")
         knee = block.get("knee")
         if knee is not None:
@@ -856,7 +856,134 @@ SBND_CHARGE_TURNON = SBND_CHARGE_TURNON_JOINT
 SBND_MC_NOISE = SBND_MC_NOISE_JOINT
 
 
-def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
+# ============================================================================================
+# CALORIMETRY TREATMENTS (kaonana CALO.199)
+#
+# A TREATMENT IS A CENTRAL VALUE PLUS THE UNIVERSES THAT ARE DELTAS ABOUT IT.  The eight
+# recombination universes are deltas about whatever chain produced `cv`, so `ccal_p` under the
+# uncorrected chain and `ccal_p` under the joint chain are different numbers answering different
+# questions.  Before this, one product carried one `cv` and there was no way to hold two chains
+# side by side -- which is what a comparison of calorimetry treatments needs.
+#
+# The rule the registry encodes:
+#
+#     a TREATMENT is a different central value; a UNIVERSE is a different delta about one.
+#
+# So the two readings of the smear amplitude's uncertainty below are two UNIVERSE PAIRS in one
+# treatment, not two treatments: they share the shipped chain as their `cv` and differ only in
+# the size of a delta.  A second treatment would duplicate thirteen universes to change two.
+# ============================================================================================
+
+#: The smear amplitude's fractional uncertainty per PLANE, from the track bootstrap's `both`-mode
+#: standard deviation on the jointly fitted scale (300 replicates), averaged over each plane's two
+#: TPC cells because the pairs agree at 0.20-0.67 sigma.
+_JOINTAMP_BOOTSTRAP = {0: 0.1152, 1: 0.1069, 2: 0.0898}
+
+#: `nu` moves the amplitude by 2.9-11.2% over the range the objective cannot resolve (`nu` 3-12).
+#: TWO READINGS SHIP because "parallel to the amplitude" justifies one pair rather than two but
+#: does NOT say whether the magnitude is the bootstrap alone or the two combined.  Both are
+#: produced and the coverage study picks; `kaonana.params.variations.active_pairs` is the single
+#: place exactly one enters a covariance, because two would count the amplitude twice.
+_JOINTAMP_NU = 0.112
+
+#: The TPC-DIFFERENTIAL part of the level, applied ANTISYMMETRICALLY within a plane.  The coherent
+#: part is already covered by `ccal` (+-2%, 4-8x larger, acting the same way); what `ccal` cannot
+#: reach is one TPC against the other, and plane 0's two cells differ by 2.66% at 4.6 sigma.  A
+#: COMMON shift here would re-book what `ccal` already has.
+_JOINTLEVEL_DIFFERENTIAL = 0.0058
+
+#: `q_power` -0.34 -> -0.63 is the MEASURED steep universe (E4: +0.128 / +0.243 / +0.185 chi2/dof
+#: on kmu / kpi / track, one-signed).  The shallow side is its mirror, a CONVENTION rather than a
+#: measurement: -0.34 sits near an optimum so both directions degrade, and the shallow lever arm
+#: is ~6x shorter.
+_JOINTSHAPE_MEASURED = -0.63
+_JOINTSHAPE_CENTRAL = -0.34
+
+
+def _jointamp_fraction(plane, reading):
+    boot = _JOINTAMP_BOOTSTRAP[int(plane)]
+    if reading == "bootstrap":
+        return boot
+    if reading == "quadrature":
+        return float((boot ** 2 + _JOINTAMP_NU ** 2) ** 0.5)
+    raise ValueError(f"unknown amplitude reading {reading!r}")
+
+
+def _amp_noise(noise, reading, sign):
+    out = {}
+    for cell, block in noise.items():
+        f = 1.0 + sign * _jointamp_fraction(cell[1], reading)
+        new = dict(block)
+        for key in ("amplitude", "amplitude_dedx", "sigma"):
+            if key in new:
+                new[key] = float(new[key]) * f
+        out[cell] = new
+    return out
+
+
+def _tilted_turnon(turnon, differential):
+    """`turnon` with the level tilted ANTISYMMETRICALLY between a plane's two TPCs."""
+    out = {}
+    for cell, block in turnon.items():
+        sign = +1.0 if int(cell[0]) == 0 else -1.0
+        new = dict(block)
+        if "level" in new:
+            new["level"] = float(new["level"]) * (1.0 + sign * differential)
+        out[cell] = new
+    return out
+
+
+def _shaped_noise(noise, q_power):
+    return {cell: {**block, "q_power": float(q_power)} for cell, block in noise.items()}
+
+
+#: The joint arm's own universes: ``name -> (turnon blocks or None, noise blocks or None)``.
+#: ``None`` means "the treatment's own", which is what every recombination universe wants.
+SBND_JOINT_UNIVERSES = {
+    "jointlevel_p": (_tilted_turnon(SBND_CHARGE_TURNON_JOINT, +_JOINTLEVEL_DIFFERENTIAL), None),
+    "jointlevel_m": (_tilted_turnon(SBND_CHARGE_TURNON_JOINT, -_JOINTLEVEL_DIFFERENTIAL), None),
+    "jointampboot_p": (None, _amp_noise(SBND_MC_NOISE_JOINT, "bootstrap", +1)),
+    "jointampboot_m": (None, _amp_noise(SBND_MC_NOISE_JOINT, "bootstrap", -1)),
+    "jointampnu_p": (None, _amp_noise(SBND_MC_NOISE_JOINT, "quadrature", +1)),
+    "jointampnu_m": (None, _amp_noise(SBND_MC_NOISE_JOINT, "quadrature", -1)),
+    "jointshape_p": (None, _shaped_noise(SBND_MC_NOISE_JOINT, _JOINTSHAPE_MEASURED)),
+    "jointshape_m": (None, _shaped_noise(
+        SBND_MC_NOISE_JOINT, 2 * _JOINTSHAPE_CENTRAL - _JOINTSHAPE_MEASURED)),
+}
+
+#: The treatments a production can be configured to write.  Each entry is
+#: ``(calo_chain, turnon, noise, universes)`` where ``universes`` maps a universe name to
+#: ``(calo_params, turnon override, noise override)``.
+#:
+#: ``default``
+#:     No chain at all -- gains, lifetime, YZ, then the recombination inversion.  This is what
+#:     LArSoft itself produces and kaonana's RUNLOG measured the agreement at **2.1e-15** over
+#:     1,003 matched tracks, so its `cv` is a regression check as much as a baseline.
+#: ``joint``
+#:     The shipped joint-shaped chain (CALO.197) with the eight recombination universes and the
+#:     eight joint ones above.
+SBND_CALO_TREATMENTS = {
+    "default": {
+        "calo_chain": False,
+        "turnon": None,
+        "noise": None,
+        "universes": {name: (params, None, None)
+                      for name, params in CALO_VARIATIONS.items()},
+    },
+    "joint": {
+        "calo_chain": True,
+        "turnon": SBND_CHARGE_TURNON_JOINT,
+        "noise": SBND_MC_NOISE_JOINT,
+        "universes": {
+            **{name: (params, None, None) for name, params in CALO_VARIATIONS.items()},
+            **{name: (CALO_VARIATIONS["cv"], turnon, noise)
+               for name, (turnon, noise) in SBND_JOINT_UNIVERSES.items()},
+        },
+    },
+}
+
+
+def sbnd_charge_turnon_factor(charge, pitch, itpc, plane, turnon=None):
     """The charge turn-on on MC's charge, frozen outside its fitted charge AND pitch windows.
 
     Verified against kaonana's `softplus_turnon` on all six cells to 2.2e-16
@@ -871,7 +998,7 @@ def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
     out = np.ones(len(charge))
     anchors = SBND_TURNON_ANCHORS
     for tpc in np.unique(itpc):
-        block = SBND_CHARGE_TURNON.get((int(tpc), int(plane)))
+        block = (SBND_CHARGE_TURNON if turnon is None else turnon).get((int(tpc), int(plane)))
         if block is None:
             continue
         rows = itpc == tpc
@@ -896,7 +1023,8 @@ def sbnd_charge_turnon_factor(charge, pitch, itpc, plane):
     return out
 
 
-def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True):
+def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True,
+                    turnon=None, noise=None):
     """TWO MC RUNGS, turn-on then smear.  DATA IS NOT TOUCHED.  Returns CORRECTED CHARGE.
 
     `charge` is the CALIBRATED dQ/dx -- gain, lifetime and YZ already in.  The recombination
@@ -967,7 +1095,7 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
     # The TURN-ON first -- see the docstring.  It is a deterministic function of the calibrated
     # charge and the pitch, so it is the rung that can be ordered by argument rather than by draw.
     charge = charge * sbnd_charge_turnon_factor(charge, np.asarray(dqdxdf.pitch, dtype=float),
-                                                itpc, plane)
+                                                itpc, plane, turnon=turnon)
     # Then the smear, which therefore gates on the TURNED-ON charge.  That is the basis kaonana
     # derives the amplitude in for this order; it is not a free choice here.
     if smear:
@@ -977,11 +1105,12 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
         charge = charge * sbnd_smear_factor(np.asarray(dqdxdf.rr, dtype=float), track,
                                             itpc, plane, seed, charge, phi,
                                             np.asarray(dqdxdf.efield, dtype=float),
-                                            np.asarray(dqdxdf.rho, dtype=float), calo_params)
+                                            np.asarray(dqdxdf.rho, dtype=float), calo_params,
+                                            noise=noise)
     return charge
 
 
-def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral", calo_chain=False, calo_seed=0, calo_smear=True):
+def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale=1, new_calo_params=None, charge="integral", calo_chain=False, calo_seed=0, calo_smear=True, calo_turnon=None, calo_noise=None):
     dqdx_v = dqdx(dqdxdf, gain=gain, calibrate=calibrate, isMC=isMC, charge=charge)
     if gain == "SBND":
 
@@ -1020,6 +1149,7 @@ def dedx(dqdxdf, gain=None, calibrate=None, plane=2, isMC=False, smear=-1, scale
         if calo_chain:
             # The five derived rungs, on the CALIBRATED charge, before the inversion.
             this_dqdx = sbnd_calo_chain(dqdxdf, this_dqdx, plane, isMC, calo_params,
+                                        turnon=calo_turnon, noise=calo_noise,
                                         seed=calo_seed, smear=calo_smear)
         dedx = calo.recombination_cor(this_dqdx, dqdxdf.phi, dqdxdf.efield, dqdxdf.rho, this_alpha_emb, this_beta_90, this_R_emb)
 

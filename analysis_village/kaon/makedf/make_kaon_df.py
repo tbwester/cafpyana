@@ -1059,82 +1059,14 @@ def _extract_base_track_df(f: dict):
             raise ValueError(f"column key {parts} is deeper than the frame ({_depth} levels)")
         return tuple(parts) + ("",) * (_depth - len(parts))
 
-    # --- CALO VARIATIONS ---
-    det = ph.loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
-    det = "SBND" if (1 == det.unique()) else "ICARUS"
-
-    hdrdf = make_mchdrdf(f)
-    ismc = hdrdf.ismc.iloc[0]
-
-    for plane in [0, 1, 2]:
-        # Load track hits for this plane
-        trkhitdf = make_trkhitdf(f, plane)
-
-        # The hits are NOT FV-filtered here.  That filter used to run on this
-        # line, and it was the last thing holding the recomputed chi2 away from
-        # the CAF's: LArSoft applies no such cut, so filtering first guaranteed a
-        # different hit set.  It was also the wrong object to cut on -- the FV
-        # box is a 10 cm fiducial inset for choosing tracks, not a hit-quality
-        # mask, and every hit it removed is a good hit inside the active volume.
-        #
-        # Two things it actively broke.  firsthit/lasthit are set in
-        # make_trkhitdf from the unfiltered hit ordering, so deleting the hit
-        # carrying lasthit left no survivor carrying it: ~lasthit then excluded
-        # nothing and the new boundary hit, precisely the one LArSoft threw out,
-        # was kept.  That fired on 76.4% of uncontained tracks.  And for a track
-        # leaving the volume the cut deletes exactly the last 26 cm the chi2 sum
-        # is built from, so 60.6% of those came back NaN in every varied column.
-        # Dropping it gives 43.7% more tracks a defined chi2.
-        #
-        # Containment is still a selection.  It is applied downstream on the
-        # track's start and end, which is where it belongs and is unaffected.
-        #
-        # "cv" is NOT skipped, and that is the point of this loop covering nine
-        # entries rather than eight.  The eight varied chi2 are recomputed here
-        # from hits, under chi2pid.chi2's rr < 26 / ~firsthit / ~lasthit cuts.
-        # The nominal chi2 they used to be compared against is not: it is read
-        # off the CAF, where LArSoft computed it at reco time.  So the ratio
-        # nominal -> varied mixed a calorimetry effect with a hit-selection
-        # difference, and the two are not separable after the fact.  Running cv
-        # through this same path gives the variations a like-for-like
-        # denominator.
-        #
-        # With the hit sets now identical and the constants matched, cv also
-        # equals the CAF nominal to float precision on every track
-        # (notebook_chi2pid C13).  chi2_{par}_I{plane} and its _cv are then the
-        # same number computed twice, once by LArSoft and once here, and that is
-        # the reason to keep both: any divergence is a regression in this chain
-        # and can be nothing else.
-        #
-        # Costs one extra dE/dx recomputation per plane, i.e. 9/8 of the previous
-        # work in this loop, and 12 columns on the track table.
-        for var_name, calo_params in chi2pid.CALO_VARIATIONS.items():
-            # charge="dqdx" reads the calorimetry's own dQ/dx off the CAF.
-            # Rebuilding it as integral/pitch cannot reproduce it: Gnocchi runs
-            # with ChargeMethod 3 and sums the integrals over the hit's snippet,
-            # and only the primary hit's integral is in the file.
-            # The derived calorimetry chain: level -> reco -> absorb -> saturation ->
-            # smear, on the calibrated charge, before the recombination inversion.  The
-            # last three are MC-only and `sbnd_calo_chain` enforces that.  The fitted
-            # blocks are held at nominal in every universe, so each variation is a
-            # variation about the CORRECTED central value -- which is what a covariance
-            # built from them assumes.  See docs/patches/cafpyana_sbnd_calo_chain.patch.
-            #
-            # calo_seed is derived from the hits themselves, never from a counter: the
-            # smear is the one stochastic rung, and a running seed would make the product
-            # depend on the order its inputs were read.  Two passes over the same
-            # flatcafs in a different order would then disagree, silently.
-            calo_seed = int(pd.util.hash_pandas_object(
-                trkhitdf.index.droplevel(-1).to_frame(index=False), index=False).sum()
-                % (2 ** 31))
-            dedx_redo = chi2pid.dedx(trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc, new_calo_params=calo_params, charge="dqdx", calo_chain=True, calo_seed=calo_seed)
-            trkhitdf["dedx_redo"] = dedx_redo
-
-            # Recalculate Chi2 for Muon, Proton, Kaon and Pion
-            for par in ['muon', 'proton', 'kaon', 'pion']:
-                this_chi2_new, _ = chi2pid.chi2par(trkhitdf, dedxname="dedx_redo", par=par)
-                pandora_df[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_{par}_{var_name}")] = this_chi2_new.fillna(0.)
-    # -----------------------
+    # The calorimetry chi2 columns are NOT built here any more (kaonana CALO.199).  They are
+    # their own product tier, `make_calo_df`, so that a calorimetry re-derivation does not
+    # require a reco reprocessing and so that several TREATMENTS can be carried against one
+    # reco pass.  What stays is the twelve BARE `chi2_{par}_I{plane}` columns the CAF itself
+    # wrote: those are LArSoft's, not this chain's, and they are the regression check that the
+    # chain reproduces the CAF.  `make_pair_df` copies whatever `chi2*` columns this frame
+    # carries onto both legs, so dropping the universes here drops 240 duplicated columns
+    # there as well -- 81% of a reco product, measured.
 
     flat_df = pandora_df.loc[:, ~pandora_df.columns.duplicated()].reset_index(level=pfp_idx_col)
 
@@ -1176,15 +1108,9 @@ def _extract_base_track_df(f: dict):
         pfp_col_key: "pfp_index",
     }
 
-    # Add systematic columns to col_map
-    # Includes "cv", matching the loop above.  chi2_{par}_I{plane}_cv does not
-    # collide with the CAF's chi2_{par}_I{plane}: both are kept, deliberately.
-    for var_name in chi2pid.CALO_VARIATIONS.keys():
-        for plane in [0, 1, 2]:
-            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_muon_{var_name}")] = f"chi2_muon_I{plane}_{var_name}"
-            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_proton_{var_name}")] = f"chi2_proton_I{plane}_{var_name}"
-            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_kaon_{var_name}")] = f"chi2_kaon_I{plane}_{var_name}"
-            col_map[_key("pfp", "trk", "chi2pid", f"I{plane}", f"chi2_pion_{var_name}")] = f"chi2_pion_I{plane}_{var_name}"
+    # No per-universe entries here: the chi2 universes are `make_calo_df`'s, keyed on the same
+    # track and joined by `(file_key, entry, rec.slc..index, pfp_index)`.  The BARE CAF columns
+    # above stay.
 
     cols_to_keep = {k: v for k, v in col_map.items() if k in flat_df.columns}
     clean_df = flat_df[list(cols_to_keep.keys())].copy()
@@ -1417,6 +1343,118 @@ PFP_GEOM_DTYPES = {
 #: No parent recorded. -1 rather than 0, which Pandora uses for a real id -- the same trap
 #: ``truth_parent`` documents in ``_extract_base_track_df``.
 PFP_NO_PARENT = -1
+
+
+#: One file's three hit tables, so that N treatment builders in a config's ``DFS`` read them once.
+#:
+#: SAFE BECAUSE OF HOW `run_df_maker` ITERATES: `ntuples.dataframes(fs=DFS)` yields one tuple of
+#: frames per file, so every builder runs on a given file before the next is opened.  A
+#: single-entry cache is therefore never stale and never grows.  Keyed on the `recTree` object's
+#: identity, because that is what the builders are handed.
+_HIT_CACHE = {}
+
+
+def _hits_for(f):
+    """This file's hit tables, read once however many treatments ask for them."""
+    token = id(f["recTree"])
+    cached = _HIT_CACHE.get(token)
+    if cached is None:
+        _HIT_CACHE.clear()
+        cached = {plane: make_trkhitdf(f, plane) for plane in (0, 1, 2)}
+        _HIT_CACHE[token] = cached
+    return cached
+
+
+def _calo_seed(hits) -> int:
+    """The seed for one (file, plane): a hash of the hit table's own track index.
+
+    NEVER FROM A COUNTER.  The smear is the one stochastic rung, and a running seed would make the
+    product depend on the order its inputs were read -- two passes over the same flatcafs in a
+    different order would disagree, silently.  Deriving it from the content instead is also what
+    lets this tier be a SEPARATE PASS from reco and still reproduce the draw.
+
+    It does NOT survive a different pandas major version (`hash_pandas_object` is not stable
+    across them), so a universe produced in one environment must not be differenced against a
+    central value produced in another -- kaonana CALO.198.
+    """
+    return int(pd.util.hash_pandas_object(
+        hits.index.droplevel(-1).to_frame(index=False), index=False).sum() % (2 ** 31))
+
+
+def make_calo_df(f: dict, treatment: str = "joint") -> pd.DataFrame:
+    """One calorimetry TREATMENT's chi2 columns: ``chi2_{hyp}_I{plane}_{universe}``.
+
+    Split out of `_base_track_df` at kaonana CALO.199.  A treatment is a central value plus the
+    universes that are deltas about it, so holding two chains side by side -- which is what
+    comparing calorimetry treatments needs -- means one frame per treatment rather than one `cv`
+    per product.  `chi2pid.SBND_CALO_TREATMENTS` is the registry.
+
+    KEYED LIKE `track`, AND THAT IS A TRAP THE PRODUCT LAYER HAS TO HANDLE.  `__ntuple` is
+    assigned by the driver from the order it read its inputs, so this pass and a reco pass number
+    the same flatcafs differently and an index join across the two is wrong while looking right.
+    A `*_calo` product therefore carries `file` and `hdr` as well, giving `(file_key, entry)`;
+    `kaonana.schema.CALO_TABLES` declares it and `kaonana.data.samples.event_key_frame` builds it.
+
+    The twelve bare `chi2_{hyp}_I{plane}` columns are NOT here -- they are LArSoft's own and stay
+    with `track`, where they are the regression check that this chain reproduces the CAF.
+    """
+    spec = chi2pid.SBND_CALO_TREATMENTS[treatment]
+    hdrdf = make_mchdrdf(f)
+    if hdrdf.empty:
+        return pd.DataFrame()
+    ismc = hdrdf.ismc.iloc[0]
+    det = ph.loadbranches(f["recTree"], ["rec.hdr.det"]).rec.hdr.det
+    det = "SBND" if (1 == det.unique()) else "ICARUS"
+
+    # Data has no MC rung, so every universe collapses onto `cv` and writing the rest would be
+    # 192 columns of identical zeros.  `variations_for(is_mc=False)` already returns only `cv` at
+    # read time; this is the write-time half of the same rule.
+    universes = spec["universes"] if ismc else {"cv": spec["universes"]["cv"]}
+
+    hits_by_plane = _hits_for(f)
+    columns = {}
+    for plane in (0, 1, 2):
+        trkhitdf = hits_by_plane[plane]
+        if trkhitdf.empty:
+            continue
+        seed = _calo_seed(trkhitdf)
+        for name, (calo_params, turnon, noise) in universes.items():
+            dedx_redo = chi2pid.dedx(
+                trkhitdf, gain=det, calibrate=det, plane=plane, isMC=ismc,
+                new_calo_params=calo_params, charge="dqdx",
+                calo_chain=spec["calo_chain"], calo_seed=seed,
+                calo_turnon=turnon if turnon is not None else spec["turnon"],
+                calo_noise=noise if noise is not None else spec["noise"],
+            )
+            scored = trkhitdf.assign(dedx_redo=dedx_redo)
+            for par in ("muon", "proton", "kaon", "pion"):
+                this_chi2, _ = chi2pid.chi2par(scored, dedxname="dedx_redo", par=par)
+                columns[f"chi2_{par}_I{plane}_{name}"] = this_chi2.fillna(0.)
+
+    if not columns:
+        return pd.DataFrame()
+    frame = pd.DataFrame(columns)
+    # Canonical level names.  The hit table keys the pfp level `rec.slc.reco.pfp..index` and the
+    # schema declares `pfp_index`; skipping this rename is the "right columns, wrong levels, joins
+    # to nothing silently" failure `kaonana.schema` exists to catch.
+    return frame.rename_axis(
+        [CALO_LEVEL_ALIASES.get(n, n) for n in frame.index.names])
+
+
+#: cafpyana's raw index level name -> the name kaonana's schema declares.  Declared rather than
+#: inferred: the slice and true-neutrino levels KEEP their raw dotted names while the pfp level is
+#: renamed, so no rule generates the set and one would be wrong on half of it.
+CALO_LEVEL_ALIASES = {"rec.slc.reco.pfp..index": "pfp_index"}
+
+
+def make_calo_default_df(f: dict) -> pd.DataFrame:
+    """The `default` treatment: no chain, nine universes. For a config's ``DFS``."""
+    return make_calo_df(f, "default")
+
+
+def make_calo_joint_df(f: dict) -> pd.DataFrame:
+    """The `joint` treatment: the shipped chain, seventeen universes. For a config's ``DFS``."""
+    return make_calo_df(f, "joint")
 
 
 def make_pfp_geom_df(f: dict) -> pd.DataFrame:

@@ -1,10 +1,18 @@
 """Pass 1 of the two-file production: everything reconstruction, no reweights.
 
-``kaon_config`` minus ``make_syst_df``.  The eight calorimetry variations stay --
-they are *recomputed reco*, one calibration each pushed through the chi2 fit, so
-they belong with the track they describe and they move when reco moves.  The
-GENIE and flux reweights are pure truth, so they go to ``kaon_syst_config`` and
-are produced once.
+``kaon_config`` minus ``make_syst_df``.  The GENIE and flux reweights are pure
+truth, so they go to ``kaon_syst_config`` and are produced once.
+
+**The calorimetry variations no longer stay** (kaonana CALO.199).  They used to,
+on the argument that they are *recomputed reco* and so belong with the track they
+describe -- which is true and turned out not to be the deciding consideration.
+They are deltas about a chosen central value, so carrying one ``cv`` per product
+makes two calorimetry treatments impossible to hold side by side; and they were
+**81% of a product's bytes**, 108 columns on ``track`` and 240 duplicated onto
+``pair``'s two legs.  They are now ``kaon_calo_config``, joined on
+``(file_key, entry, rec.slc..index, pfp_index)``.  What stays here is the twelve
+BARE ``chi2_{hyp}_I{plane}`` columns LArSoft itself wrote, which are the
+regression check that the chain reproduces the CAF.
 
 Not ``kaon_train_config``, which also drops ``syst``: that one additionally drops
 ``true_kaon``, which the analysis export carries, and warns against merging its
