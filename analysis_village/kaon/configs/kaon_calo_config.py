@@ -24,9 +24,15 @@ same flatcaf.  Justify this split on bookkeeping, not on speed.
 Two treatments
 --------------
 ``calo_default``
-    No chain -- gains, lifetime, YZ, then the recombination inversion.  This is what LArSoft
-    itself produces (kaonana's RUNLOG measured the agreement at 2.1e-15 over 1,003 matched
-    tracks), so its ``cv`` is a regression check as much as a baseline.  Nine universes.
+    No chain -- gains, lifetime, YZ, then the recombination inversion.  The uncorrected baseline
+    a treatment comparison is measured against.  Nine universes.
+
+    **It is NOT LArSoft's own number and must not be read as a check on it.**  The chain
+    recomputes dE/dx with this repo's gains and inverts on MC's ModBox for *both* samples
+    (CALO.86), so ``calo_default``'s ``cv`` sits near 0.49 of the CAF's proton chi2 and 0.71 of
+    its kaon chi2 -- measured, and the same structure the old products showed at 0.4591 and
+    0.6602 with the joint chain.  RUNLOG's 2.1e-15 was *production against production* with the
+    constants unchanged, which is a different comparison.
 ``calo_joint``
     The shipped joint-shaped chain (CALO.197), with the eight recombination universes and eight
     joint ones.  Seventeen universes, including **both readings of the smear amplitude's
