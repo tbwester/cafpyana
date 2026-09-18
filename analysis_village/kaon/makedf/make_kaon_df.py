@@ -1346,23 +1346,31 @@ PFP_NO_PARENT = -1
 
 
 #: One file's three hit tables, so that N treatment builders in a config's ``DFS`` read them once.
+#: Reading hits is the expensive part of a calo pass, and `run_df_maker` calls each builder in
+#: `DFS` separately, so without this a second treatment would pay for the hits twice.
 #:
 #: SAFE BECAUSE OF HOW `run_df_maker` ITERATES: `ntuples.dataframes(fs=DFS)` yields one tuple of
-#: frames per file, so every builder runs on a given file before the next is opened.  A
-#: single-entry cache is therefore never stale and never grows.  Keyed on the `recTree` object's
-#: identity, because that is what the builders are handed.
-_HIT_CACHE = {}
+#: frames per file, so every builder runs on a given file before the next is opened.  One entry is
+#: therefore enough, and it is never stale.
+#:
+#: IT HOLDS THE OBJECT, NOT ITS `id()`, AND THAT IS THE WHOLE POINT.  An `id()` key is a live
+#: correctness bug here: CPython reuses an address as soon as the previous object is freed --
+#: measured, **183 collisions in 200** short-lived same-type objects -- so the moment file B's
+#: `recTree` lands where file A's just was, an `id()` lookup hits and hands B **file A's hits**.
+#: Every universe of every treatment for B would then be computed from A's charge, and because the
+#: driver assigns `__ntuple` itself the product would look entirely plausible.  A single-file
+#: smoke test cannot see this, which is what makes it worth spelling out.  Holding the reference
+#: keeps the address alive, so it cannot be recycled and `is` is exact.
+_HIT_CACHE = {"recTree": None, "hits": None}
 
 
 def _hits_for(f):
     """This file's hit tables, read once however many treatments ask for them."""
-    token = id(f["recTree"])
-    cached = _HIT_CACHE.get(token)
-    if cached is None:
-        _HIT_CACHE.clear()
-        cached = {plane: make_trkhitdf(f, plane) for plane in (0, 1, 2)}
-        _HIT_CACHE[token] = cached
-    return cached
+    tree = f["recTree"]
+    if _HIT_CACHE["recTree"] is not tree:
+        _HIT_CACHE["recTree"] = tree
+        _HIT_CACHE["hits"] = {plane: make_trkhitdf(f, plane) for plane in (0, 1, 2)}
+    return _HIT_CACHE["hits"]
 
 
 def _calo_seed(hits) -> int:
