@@ -646,8 +646,15 @@ def make_true_type_df(f) -> pd.DataFrame:
     Creates a minimal dataframe with exactly 1 row per true neutrino interaction.
     """
     # 1. Load basic neutrino info
+    #
+    # NOTE the invariant mass branch is `w`, LOWERCASE, unlike every other
+    # kinematic on this object -- there is no `rec.mc.nu.W`, and a grep for the
+    # obvious spelling concludes the quantity is absent when it is not.
     nu_branches = ['rec.mc.nu.E', 'rec.mc.nu.iscc', 'rec.mc.nu.genie_mode',
-                   'rec.mc.nu.position.x', 'rec.mc.nu.position.y', 'rec.mc.nu.position.z']
+                   'rec.mc.nu.position.x', 'rec.mc.nu.position.y', 'rec.mc.nu.position.z',
+                   'rec.mc.nu.w', 'rec.mc.nu.Q2', 'rec.mc.nu.bjorkenX',
+                   'rec.mc.nu.inelasticityY', 'rec.mc.nu.genie_inttype',
+                   'rec.mc.nu.targetPDG']
     mcdf = ph.loadbranches(f["recTree"], nu_branches).rec.mc.nu
 
     is_cc = mcdf['iscc'] == 1
@@ -693,6 +700,25 @@ def make_true_type_df(f) -> pd.DataFrame:
     # "other" bucket. -1 means the interaction carries no mode at all, which
     # is not the same as mode 0.
     res['genie_mode'] = mcdf['genie_mode'].fillna(-1).astype(int)
+
+    # Interaction kinematics, as GENIE recorded them. float32 because that is
+    # the CAF's own storage class for all four and nothing here needs more.
+    # Left UNFILLED, like true_E_nu above: an interaction with no GENIE record
+    # has no W, and NaN says so where a sentinel would have to be excluded by
+    # hand at every use.
+    res['true_W'] = mcdf['w'].astype('float32')
+    res['true_Q2'] = mcdf['Q2'].astype('float32')
+    res['true_bjorken_x'] = mcdf['bjorkenX'].astype('float32')
+    res['true_inelasticity_y'] = mcdf['inelasticityY'].astype('float32')
+
+    # The two integer kinematics, filled like genie_mode because an integer
+    # column cannot hold NaN.
+    #
+    # target_pdg is int32 and MUST BE: a PDG nuclear code runs to ~1e9
+    # (1000180400 is argon-40), so int16 overflows silently and the column
+    # comes back as plausible small numbers. The CAF stores it as >i4.
+    res['genie_inttype'] = mcdf['genie_inttype'].fillna(-1).astype('int32')
+    res['target_pdg'] = mcdf['targetPDG'].fillna(-1).astype('int32')
 
     # Final-state multiplicities above threshold, one column per species.
     # n_kplus supersedes the old standalone 'nkplus'.
@@ -764,7 +790,9 @@ def make_true_type_df(f) -> pd.DataFrame:
     # is_true_fv was previously computed and then dropped; it is needed to
     # reconstruct the true_type decision downstream.
     keep_cols = (['true_type', 'is_cc', 'genie_mode', 'is_true_fv', 'is_k_contained',
-                  'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions']
+                  'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions',
+                  'true_W', 'true_Q2', 'true_bjorken_x', 'true_inelasticity_y',
+                  'genie_inttype', 'target_pdg']
                  + list(KORIGIN_COUNT_COLS.values())
                  + list(PRIM_SPECIES))
     return res[keep_cols]
@@ -1436,12 +1464,41 @@ def make_calo_df(f: dict, treatment: str = "joint") -> pd.DataFrame:
             )
             scored = trkhitdf.assign(dedx_redo=dedx_redo)
             for par in ("muon", "proton", "kaon", "pion"):
-                this_chi2, _ = chi2pid.chi2par(scored, dedxname="dedx_redo", par=par)
+                this_chi2, this_ndof = chi2pid.chi2par(scored, dedxname="dedx_redo", par=par)
                 columns[f"chi2_{par}_I{plane}_{name}"] = this_chi2.fillna(0.)
+                # The hit count the chi2 was actually averaged over.  `chi2pid.chi2` returns
+                # sum/size, so the exported chi2 is already chi2/ndof and this is what says how
+                # PRECISE that number is: the fractional error goes as sqrt(2/ndof), which is 16%
+                # at ndof 78 and 58% at ndof 6 -- the two legs of one kdev candidate, kaonana
+                # V3.152.  It is NOT recomputable downstream; see that entry.
+                #
+                # ONE COLUMN PER PLANE, NOT PER UNIVERSE.  `chi2par`'s mask is
+                # `(rr < 26) & ~firsthit & ~lasthit & (dedx < 1000)` and only the last term sees
+                # the varied dE/dx, so ndof is universe-independent except where a universe pushes
+                # a hit across the saturation guard.  Measured over the joint treatment's 17
+                # universes: 0 of 13,472 track-universe comparisons differ on kcv and 2 of 19,264
+                # (0.01%) on kdev.  Carrying it per universe would be 51 columns to express one.
+                # It is taken from `cv`, which every treatment defines and data carries alone.
+                #
+                # Not filled or cast here.  The four chi2 columns of this (plane, universe) share
+                # this index exactly -- they come from the same groupby -- but a track with hits
+                # on one plane and not another is absent from the other plane's index, and
+                # `pd.DataFrame` fills that with NaN.  The cast to a nullable integer therefore
+                # happens after the frame is built, where the union index is known.
+                if name == "cv" and par == "kaon":
+                    columns[f"ndof_I{plane}"] = this_ndof
 
     if not columns:
         return pd.DataFrame()
     frame = pd.DataFrame(columns)
+    # A track with no hit in this plane's chi2 window has no ndof, which is 0 hits and not
+    # "unknown" -- so it is filled rather than left NaN.  int16 against a bound of ~100 hits in
+    # 26 cm (the observed maximum on kdev is 108): three orders of margin, and unlike a PDG
+    # nuclear code there is no way for this quantity to reach 32767.
+    for iplane in (0, 1, 2):
+        ndof_col = f"ndof_I{iplane}"
+        if ndof_col in frame.columns:
+            frame[ndof_col] = frame[ndof_col].fillna(0).astype("int16")
     # Canonical level names.  The hit table keys the pfp level `rec.slc.reco.pfp..index` and the
     # schema declares `pfp_index`; skipping this rename is the "right columns, wrong levels, joins
     # to nothing silently" failure `kaonana.schema` exists to catch.
