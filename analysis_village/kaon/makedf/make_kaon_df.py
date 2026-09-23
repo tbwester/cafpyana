@@ -12,6 +12,7 @@ from makedf.makedf import make_mchdrdf, make_trkhitdf
 
 from . import range_momentum
 from .provenance import UNKNOWN_FILE_KEY, file_key
+from .stamp import stamp_columns
 
 KPDG = {'kplus': 321, 'kzero': 311}
 KMASS = {'kplus': 0.493677, 'kzero': 0.497611}
@@ -860,6 +861,10 @@ def make_file_df(f) -> pd.DataFrame:
     reverse, and a None return is dropped from that list rather than held as a
     gap, which would silently shift every table's name.
 
+    Every row also carries the product stamp -- ``kaon_format``, ``producer_commit``,
+    ``producer_dirty`` -- recording what processed each input file.  Provenance only;
+    see ``stamp``.
+
     Must stay LAST in the config's DFS.  The reverse zip means the makers that run
     without a recTree have to be a suffix of DFS for the names to line up;
     _file_level_dfs raises if they are not.
@@ -888,6 +893,7 @@ def make_file_df(f) -> pd.DataFrame:
         {
             "file_key": pd.Series([file_key(name)], dtype="uint64"),
             "n_entry": pd.Series([n_entry], dtype="int64"),
+            **{k: pd.Series([v]) for k, v in stamp_columns().items()},
         }
     )
     df.index.name = "entry"
