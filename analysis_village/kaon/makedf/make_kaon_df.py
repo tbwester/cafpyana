@@ -1505,6 +1505,12 @@ def make_calo_df(f: dict, treatment: str = "joint") -> pd.DataFrame:
         ndof_col = f"ndof_I{iplane}"
         if ndof_col in frame.columns:
             frame[ndof_col] = frame[ndof_col].fillna(0).astype("int16")
+    # float32 for the chi2 columns, which are nearly all of the tier: it halves the product
+    # (kaonana V4.13, 32.3 -> 16.4 MB on kcv_calo_0). The BDTs score float32 inputs anyway, and a
+    # chi2 near 1-100 keeps ~7 significant digits against a calibration good to percents; no
+    # score or selection moved on the product measured.
+    chi2_columns = [c for c in frame.columns if c.startswith("chi2_")]
+    frame[chi2_columns] = frame[chi2_columns].astype("float32")
     # Canonical level names.  The hit table keys the pfp level `rec.slc.reco.pfp..index` and the
     # schema declares `pfp_index`; skipping this rename is the "right columns, wrong levels, joins
     # to nothing silently" failure `kaonana.schema` exists to catch.
