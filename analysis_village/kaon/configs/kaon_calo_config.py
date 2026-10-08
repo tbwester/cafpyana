@@ -1,4 +1,4 @@
-"""A fourth pass: the calorimetry chi2 universes, two TREATMENTS side by side.
+"""A fourth pass: the calorimetry chi2 universes, three TREATMENTS side by side.
 
 Split out of ``kaon_reco_config`` at kaonana CALO.199, for two reasons that are not the obvious
 one.
@@ -21,8 +21,8 @@ is roughly **half to two-thirds** of a reco pass -- reading hits is the expensiv
 calo-only pass still reads them.  On the grid it is worse, because a calo-only pass transfers the
 same flatcaf.  Justify this split on bookkeeping, not on speed.
 
-Two treatments
---------------
+Three treatments
+----------------
 ``calo_default``
     No chain -- gains, lifetime, YZ, then the recombination inversion.  The uncorrected baseline
     a treatment comparison is measured against.  Nine universes.
@@ -39,8 +39,13 @@ Two treatments
     uncertainty** -- ``jointampboot`` and ``jointampnu`` -- because which one to book is a
     coverage question and the study needs both produced.  Exactly one may enter a covariance;
     ``kaonana.params.variations.active_pairs`` is where that is chosen.
+``calo_stochastic``
+    geomcalo CALO.204's candidate: the stochastic-plus-noise kernel at twice V7's correlation
+    lengths, no knee, with its own flat levels (``cafpyana_sbnd_calo_stochastic.patch``).  The
+    eight recombination universes only; its kernel universes are not ported, so this ``cv`` is
+    for E4 against ``calo_joint``.  Nine universes.
 
-Both treatments read the hits ONCE.  ``make_calo_df`` caches them per file, which is safe because
+Every treatment reads the hits ONCE.  ``make_calo_df`` caches them per file, which is safe because
 ``ntuples.dataframes`` yields one tuple of frames per file, so every builder in ``DFS`` runs on a
 given file before the next is opened.  Two passes would pay the hit read twice.
 
@@ -71,9 +76,10 @@ DO NOT merge these products with the reco products.  They are joined, not concat
 from analysis_village.kaon.makedf.make_kaon_df import (
     make_calo_default_df,
     make_calo_joint_df,
+    make_calo_stochastic_df,
     make_file_df,
 )
 from makedf.makedf import make_hdrdf
 
-DFS = [make_calo_default_df, make_calo_joint_df, make_hdrdf, make_file_df]
-NAMES = ["calo_default", "calo_joint", "hdr", "file"]
+DFS = [make_calo_default_df, make_calo_joint_df, make_calo_stochastic_df, make_hdrdf, make_file_df]
+NAMES = ["calo_default", "calo_joint", "calo_stochastic", "hdr", "file"]

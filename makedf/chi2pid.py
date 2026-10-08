@@ -579,8 +579,30 @@ def sbnd_amplification(charge, phi, efield, density, calo_params, step=0.01):
     return np.where(np.isfinite(out), np.maximum(out, 1.0), 1.0)
 
 
+def sbnd_stochastic_amplitude(charge, pitch, phi, block):
+    """The `form="stochastic"` amplitude per hit (kaonana CALO.203-204, form B).
+
+    `Var_data - Var_MC = S h Q + N w` in electrons^2 on the charge on the hit `Q = q pitch`, returned
+    as a fractional width `sqrt(max(0, .)) / Q`.  `S` is the stochastic term, `N` the electronics-noise
+    difference (negative: MC is noisier), `h` a slope in the hit's drift extent `d = pitch |cos phi|`
+    and `w = sqrt(1 + (d / d_tau)^2)` the pulse-length weight on `N`, both 1 at the cell's median
+    extent `d0`.  Zero where MC is already at least as wide as data: a smear cannot remove variance,
+    which is what replaces the knee.  Mirrors `geomcalo.noise.stochastic_amplitude` operation for
+    operation; the tests pin the two.
+    """
+    charge = np.asarray(charge, dtype=float)
+    pitch = np.asarray(pitch, dtype=float)
+    q_hit = np.maximum(charge * pitch, float(block["q_floor"]))
+    d = pitch * np.abs(np.cos(np.asarray(phi, dtype=float)))
+    d0, d_tau = float(block["d0"]), float(block["d_tau"])
+    h = np.clip(1.0 + float(block["beta_d"]) * (d / d0 - 1.0), 0.0, None)
+    w = np.sqrt(1.0 + (d / d_tau) ** 2) / np.sqrt(1.0 + (d0 / d_tau) ** 2)
+    variance = float(block["S"]) * h * q_hit + float(block["N"]) * w
+    return np.sqrt(np.clip(variance, 0.0, None)) / q_hit
+
+
 def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, density,
-                      calo_params, noise=None):
+                      calo_params, noise=None, pitch=None):
     """The stochastic factor on MC's charge.
 
     Reads whichever amplitude key `SBND_MC_NOISE` carries -- `amplitude` (charge) or `amplitude_dedx`
@@ -650,6 +672,15 @@ def sbnd_smear_factor(rr, track_id, itpc, plane, seed, charge, phi, efield, dens
             codes = rank[inverse]
             draws = np.random.default_rng(cell_seed + 77).chisquare(nu, size=len(first_index))
             field = field * np.sqrt(nu / draws)[codes]
+        if block.get("form") == "stochastic":
+            # Keyed on the charge as it arrives and the hit's own pitch and angle; no knee.
+            if pitch is None or phi is None:
+                raise ValueError(f"noise block [{int(tpc)}, {int(plane)}] is stochastic and needs "
+                                 "`pitch` and `phi`")
+            out[rows] = np.exp(field * sbnd_stochastic_amplitude(
+                np.asarray(charge, dtype=float)[rows], np.asarray(pitch, dtype=float)[rows],
+                np.asarray(phi, dtype=float)[rows], block))
+            continue
         if "amplitude" in block:
             amplitude = block["amplitude"]
             if "q_power" in block:
@@ -856,6 +887,49 @@ SBND_CHARGE_TURNON = SBND_CHARGE_TURNON_JOINT
 SBND_MC_NOISE = SBND_MC_NOISE_JOINT
 
 
+# ---------------------------------------------------------------------------------------------------
+# THE STOCHASTIC-PLUS-NOISE KERNEL (kaonana CALO.203-204), A CANDIDATE FOR E4.  NOT THE SHIPPED CHAIN.
+#
+# The generator is the joint arm's -- a correlated field per cell times a per-track Student scale --
+# at TWICE V7's per-cell lengths, and the amplitude is `sbnd_stochastic_amplitude` with no knee.
+# Out of sample on the control sample's pull objective it is 2.5% below the joint arm; nothing is
+# on the analysis yet.  Full precision: the tests assert exact agreement with geomcalo.
+# ---------------------------------------------------------------------------------------------------
+
+#: Flat per-cell level fitted with the stochastic kernel held (kaonana `TURNON_STOCHASTIC`).
+SBND_CHARGE_TURNON_STOCHASTIC = {
+    (0, 0): dict(form="flat", level=1.0038937012021436),
+    (1, 0): dict(form="flat", level=1.0393354000563417),
+    (0, 1): dict(form="flat", level=1.0027068257583236),
+    (1, 1): dict(form="flat", level=1.0168125545108155),
+    (0, 2): dict(form="flat", level=0.9988929926003993),
+    (1, 2): dict(form="flat", level=1.012450875991327),
+}
+
+#: `S` [e], `N` [e^2], `beta_d`, `d0` [cm] fitted; `d_tau` [cm], `q_floor` [e], `nu` and the doubled
+#: `length_cm` held (kaonana `NOISE_STOCHASTIC`).
+SBND_MC_NOISE_STOCHASTIC = {
+    (0, 0): dict(form="stochastic", S=168.25822921240788, N=-1732410.6097116536,
+                 beta_d=0.2869401475042696, d0=0.19674309174571913, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.5068, nu=5.0),
+    (1, 0): dict(form="stochastic", S=199.79255223558647, N=-3637931.2354175076,
+                 beta_d=0.24645478986346125, d0=0.18675682219171152, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.1392, nu=5.0),
+    (0, 1): dict(form="stochastic", S=240.5126414035178, N=-2301734.2548923614,
+                 beta_d=0.5874861652116612, d0=0.17978683972714649, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.34, nu=5.0),
+    (1, 1): dict(form="stochastic", S=257.1906879222016, N=-1939282.2243517672,
+                 beta_d=0.38512865698333865, d0=0.1825156542806674, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.1258, nu=5.0),
+    (0, 2): dict(form="stochastic", S=140.82226695014919, N=-2784674.783581584,
+                 beta_d=0.16052813773369473, d0=0.15884015462273027, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.4126, nu=5.0),
+    (1, 2): dict(form="stochastic", S=141.62171162545047, N=-3049443.21471648,
+                 beta_d=0.203284247118791, d0=0.14454728491744628, d_tau=0.25, q_floor=1.0e4,
+                 length_cm=1.1572, nu=5.0),
+}
+
+
 # ============================================================================================
 # CALORIMETRY TREATMENTS (kaonana CALO.199)
 #
@@ -983,6 +1057,18 @@ SBND_CALO_TREATMENTS = {
 }
 
 
+#: ``stochastic``
+#:     The stochastic-plus-noise candidate (kaonana CALO.204) with the eight recombination universes.
+#:     Its kernel universes -- the fit-level bootstrap replicas, the length and `d_tau` ranges -- are
+#:     not ported yet; until they are, this treatment's `cv` is for E4 against `joint` only.
+SBND_CALO_TREATMENTS["stochastic"] = {
+    "calo_chain": True,
+    "turnon": SBND_CHARGE_TURNON_STOCHASTIC,
+    "noise": SBND_MC_NOISE_STOCHASTIC,
+    "universes": {name: (params, None, None) for name, params in CALO_VARIATIONS.items()},
+}
+
+
 def sbnd_charge_turnon_factor(charge, pitch, itpc, plane, turnon=None):
     """The charge turn-on on MC's charge, frozen outside its fitted charge AND pitch windows.
 
@@ -1106,7 +1192,8 @@ def sbnd_calo_chain(dqdxdf, charge, plane, isMC, calo_params, seed=0, smear=True
                                             itpc, plane, seed, charge, phi,
                                             np.asarray(dqdxdf.efield, dtype=float),
                                             np.asarray(dqdxdf.rho, dtype=float), calo_params,
-                                            noise=noise)
+                                            noise=noise,
+                                            pitch=np.asarray(dqdxdf.pitch, dtype=float))
     return charge
 
 

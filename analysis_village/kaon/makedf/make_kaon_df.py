@@ -1534,6 +1534,15 @@ def make_calo_joint_df(f: dict) -> pd.DataFrame:
     return make_calo_df(f, "joint")
 
 
+def make_calo_stochastic_df(f: dict) -> pd.DataFrame:
+    """The `stochastic` treatment: geomcalo CALO.204's candidate kernel, nine universes.
+
+    Needs `cafpyana_sbnd_calo_stochastic.patch`, which defines the treatment; written beside
+    `joint` in one pass so E4 compares the two on byte-identical inputs.
+    """
+    return make_calo_df(f, "stochastic")
+
+
 def make_pfp_geom_df(f: dict) -> pd.DataFrame:
     """One row per pfp: the track direction at both ends, and its place in the hierarchy.
 
