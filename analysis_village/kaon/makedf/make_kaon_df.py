@@ -917,8 +917,8 @@ def make_slice_df(f: dict) -> pd.DataFrame:
         'rec.slc.is_clear_cosmic',
         'rec.slc.barycenterFM.score',
         'rec.slc.tmatch.index',
-        # The reconstructed slice vertex. legacy_make_kaon_df.make_kaon_recodf
-        # applied InFV_SBND(slc.vertex) as a production pre-cut, so kaonana's
+        # The reconstructed slice vertex. The v2 writer applied
+        # InFV_SBND(slc.vertex) as a production pre-cut, so kaonana's
         # cutflow inherited it and the pair BDT was trained downstream of it --
         # but it is in no cut sequence and in none of the new products, so the
         # port has been running without it. Exported rather than applied, per
@@ -1574,3 +1574,268 @@ def make_pfp_geom_df(f: dict) -> pd.DataFrame:
     frame = frame.astype(PFP_GEOM_DTYPES)
     frame.index = frame.index.set_names([*frame.index.names[:-1], "pfp_index"])
     return frame.sort_index()
+
+
+# --- showers ------------------------------------------------------------------
+# Two tiers for a pi0 side band (kaonana docs/notes/pi0_sideband_promotion.md, V4.56):
+# ``make_shower_df`` is the CAF's shower reconstruction per pfp, with its backtracked truth;
+# ``make_shower_calo_df`` is the shower dE/dx and energy in every calorimetry universe. Both are
+# keyed like ``make_track_df``. The Pandora hierarchy is not repeated here: ``make_pfp_geom_df``
+# already carries pfp_id, pfp_parent and parent_is_primary on the same key.
+
+#: CAF branch (under rec.slc.reco.) -> column.
+SHOWER_COLUMNS = {
+    "pfp.trackScore": "trackScore",
+    "pfp.shw.conversion_gap": "conversion_gap",
+    "pfp.shw.bestplane_dEdx": "bestplane_dEdx",
+    "pfp.shw.bestplane_energy": "bestplane_energy",
+    "pfp.shw.bestplane_for_dedx": "bestplane_for_dedx",
+    "pfp.shw.bestplane_for_energy": "bestplane_for_energy",
+    "pfp.shw.len": "len",
+    "pfp.shw.open_angle": "open_angle",
+    "pfp.shw.density": "density",
+    **{f"pfp.shw.{v}.{c}": f"{v}_{c}" for v in ("start", "dir") for c in "xyz"},
+    **{f"pfp.shw.plane.{p}.{q}": f"{q}_I{p}" for p in range(3) for q in ("dEdx", "energy", "nHits")},
+    "pfp.shw.truth.p.pdg": "truth_pdg",
+    "pfp.shw.truth.p.G4ID": "truth_G4ID",
+    "pfp.shw.truth.p.parent": "truth_parent",
+    "pfp.shw.truth.p.interaction_id": "truth_interaction_id",
+    "pfp.shw.truth.p.genE": "truth_genE",
+    "pfp.shw.truth.bestmatch.energy_purity": "truth_energy_purity",
+    "pfp.shw.truth.bestmatch.energy_completeness": "truth_energy_completeness",
+}
+
+#: Quantities that cannot be negative. The CAF writes -5 for "not computed" and the dE/dx tool
+#: -999 for a plane it failed on; both become NaN, so no cut or mean can read them as values.
+SHOWER_NONNEGATIVE = (
+    "conversion_gap", "bestplane_dEdx", "bestplane_energy", "len", "open_angle", "density",
+    *[f"{q}_I{p}" for p in range(3) for q in ("dEdx", "energy")],
+)
+
+#: G4 track IDs come in blocks of 1e7, one per simulation stage (10000001.., 20000001..). A
+#: primary's parent is its block base, 10000000, NOT 0 -- so ``parent > 0`` does not mean "has
+#: a parent". (entry, G4ID) is unique in rec.true_particles.
+G4_ID_BLOCK = 10_000_000
+
+#: Steps the EM origin walk may climb. The CAF stores no shower e+-, so a photon's parent is
+#: its pi0 and the walk climbs at most one step on these productions; the limit is a guard.
+SHOWER_ORIGIN_MAX_DEPTH = 8
+
+#: ``origin_status``: how the walk ended.
+ORIGIN_SELF = 0          # best match is not a photon or electron: it is its own origin
+ORIGIN_ANCESTOR = 1      # climbed to the first non-EM ancestor
+ORIGIN_PRIMARY_EM = 2    # an EM particle with no parent (a primary photon or electron)
+ORIGIN_MISSING = 3       # the parent is not in rec.true_particles
+ORIGIN_DEPTH_LIMIT = 4
+ORIGIN_UNMATCHED = 5     # the pfp has no backtracked particle
+
+_EM_PDGS = (11, -11, 22)
+
+
+def _has_g4_parent(parent):
+    parent = np.asarray(parent, dtype=np.int64)
+    return (parent > 0) & (parent < 2**31) & (parent % G4_ID_BLOCK != 0)
+
+
+def _shower_origin(truth: pd.DataFrame, tpartdf: pd.DataFrame) -> pd.DataFrame:
+    """Walk each best match up through photons and electrons to its first non-EM ancestor.
+
+    Returns the ancestor's pdg and G4ID, and that ancestor's own parent's pdg and G4ID, so a
+    photon from a K+ -> pi+ pi0 is a join on the kaon's G4ID. A best match that is not EM is
+    its own origin. Unknown values are 0, as for ``truth_pdg`` and ``truth_G4ID``.
+    """
+    tp = _flat_true_particles(tpartdf)[["entry", "G4ID", "pdg", "parent"]]
+    tp = tp.astype({"G4ID": np.int64, "pdg": np.int64, "parent": np.int64})
+    pdg_of = dict(zip(zip(tp.entry, tp.G4ID), tp.pdg))
+    parent_of = dict(zip(zip(tp.entry, tp.G4ID), tp.parent))
+
+    entry = truth.index.get_level_values("entry").to_numpy()
+    pdg = truth["truth_pdg"].to_numpy(np.int64).copy()
+    g4 = truth["truth_G4ID"].to_numpy(np.int64).copy()
+    parent = truth["truth_parent"].to_numpy(np.int64).copy()
+    status = np.where(np.isin(pdg, _EM_PDGS), ORIGIN_ANCESTOR, ORIGIN_SELF).astype(np.int8)
+    status[pdg == 0] = ORIGIN_UNMATCHED
+    depth = np.zeros(len(truth), dtype=np.int8)
+
+    for _ in range(SHOWER_ORIGIN_MAX_DEPTH):
+        climb = np.isin(pdg, _EM_PDGS) & (status == ORIGIN_ANCESTOR)
+        no_parent = climb & ~_has_g4_parent(parent)
+        status[no_parent] = ORIGIN_PRIMARY_EM
+        climb &= ~no_parent
+        if not climb.any():
+            break
+        for i in np.flatnonzero(climb):
+            key = (entry[i], parent[i])
+            if key not in pdg_of:
+                status[i] = ORIGIN_MISSING
+                continue
+            g4[i], pdg[i], parent[i] = parent[i], pdg_of[key], parent_of[key]
+            depth[i] += 1
+    status[np.isin(pdg, _EM_PDGS) & (status == ORIGIN_ANCESTOR)] = ORIGIN_DEPTH_LIMIT
+
+    found = np.isin(status, (ORIGIN_SELF, ORIGIN_ANCESTOR))
+    has_parent = found & _has_g4_parent(parent)
+    grand_pdg = np.array([pdg_of.get((e, p), 0) if ok else 0
+                          for e, p, ok in zip(entry, parent, has_parent)], dtype=np.int64)
+    return pd.DataFrame({
+        "origin_pdg": np.where(found, pdg, 0).astype(np.int32),
+        "origin_G4ID": np.where(found, g4, 0).astype(np.int32),
+        "origin_parent_pdg": np.where(has_parent, grand_pdg, 0).astype(np.int32),
+        "origin_parent_G4ID": np.where(has_parent, parent, 0).astype(np.int32),
+        "origin_depth": depth,
+        "origin_status": status,
+    }, index=truth.index)
+
+
+def _shower_branches(f: dict, columns: dict) -> pd.DataFrame:
+    """*columns*' branches per pfp, renamed, clear cosmics dropped as ``make_track_df`` does."""
+    frame = ph.loadbranches(f["recTree"], [f"rec.slc.reco.{b}" for b in columns]).rec.slc.reco
+    if frame.empty:
+        return pd.DataFrame()
+    frame.columns = ['.'.join(str(n) for n in c if n != '') for c in frame.columns]
+    # loadbranches spells the plane index I0..I2.
+    frame.columns = [c.replace(".plane.I", ".plane.") for c in frame.columns]
+    frame = frame[list(columns)].rename(columns=columns)
+
+    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
+    if isinstance(slc_df.columns, pd.MultiIndex):
+        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
+    is_cosmic = (slc_df['is_clear_cosmic'] == 1).reindex(frame.index.droplevel(-1))
+    frame = frame[~is_cosmic.to_numpy()]
+    frame.index = frame.index.set_names([*frame.index.names[:-1], "pfp_index"])
+    return frame
+
+
+def make_shower_df(f: dict) -> pd.DataFrame:
+    """One row per pfp: the CAF's shower fit, and what its best match came from.
+
+    Keyed as ``make_track_df`` is, ``(entry, rec.slc..index, pfp_index)``, clear cosmics
+    dropped; every pfp is kept, track-like or not, because which pfps are photons is the
+    analysis' cut. ``hdr`` and ``file`` ship alongside for the ``(file_key, entry)`` join.
+
+    The CAF's -5 / -999 on the non-negative quantities become NaN (``SHOWER_NONNEGATIVE``);
+    the best-plane indices take -1 for "none". Unmatched truth takes the ``track`` sentinels:
+    pdg and G4ID 0, parent and interaction_id -1. ``truth.p.parent`` is uint32 in the CAF, so
+    it is cast to signed before any comparison.
+    """
+    frame = _shower_branches(f, SHOWER_COLUMNS)
+    if frame.empty:
+        return pd.DataFrame()
+
+    for col in SHOWER_NONNEGATIVE:
+        frame[col] = frame[col].astype("float32").where(frame[col] >= 0)
+    for col in ("bestplane_for_dedx", "bestplane_for_energy"):
+        frame[col] = frame[col].where(frame[col] >= 0, -1).astype("int8")
+    for p in range(3):
+        frame[f"nHits_I{p}"] = frame[f"nHits_I{p}"].astype("int32")
+
+    unmatched = np.iinfo(np.int32).min
+    frame["truth_parent"] = frame["truth_parent"].astype(np.int64)
+    frame.loc[frame["truth_parent"] >= 2**31, "truth_parent"] = -1
+    for col, fill in (("truth_pdg", 0), ("truth_G4ID", 0), ("truth_parent", -1),
+                      ("truth_interaction_id", -1)):
+        frame[col] = frame[col].replace(unmatched, fill).astype("int32")
+    frame.loc[frame["truth_pdg"] == 0, ["truth_parent", "truth_interaction_id"]] = -1
+
+    frame = frame.join(_shower_origin(frame, _true_particles(f)))
+    floats = [c for c in frame.columns if frame[c].dtype == np.float64]
+    frame[floats] = frame[floats].astype("float32")
+    return frame.sort_index()
+
+
+#: The planes' CAF dE/dx and energy, the inputs the shower calo tier varies.
+SHOWER_CALO_INPUTS = {
+    **{f"pfp.shw.plane.{p}.{q}": f"{q}_I{p}" for p in range(3) for q in ("dEdx", "energy")},
+    "pfp.shw.bestplane_for_dedx": "bestplane_for_dedx",
+}
+
+
+def _recombination(params) -> dict:
+    """The chain's recombination parameters: MC's slot, as ``chi2pid.dedx`` uses for both."""
+    return {"A": params["alpha_emb"][0], "B90": params["beta_90"][0], "R": params["R_emb"][0]}
+
+
+def make_shower_calo_df(f: dict, treatment: str = "default") -> pd.DataFrame:
+    """Shower dE/dx and energy per plane in every calorimetry universe of *treatment*.
+
+    No hits are read. The CAF's ``shw.plane.N.dEdx`` is larpandora's ShowerTrajPointdEdx: the
+    MEDIAN over the shower's initial-track hits of ``CalorimetryAlg::dEdx_AREA`` at its default
+    phi = 90 deg. A universe applies one monotonic map to every hit's dQ/dx -> dE/dx, so the
+    median commutes with it (exactly, up to an even-count median). Per plane and universe u:
+
+        q      = R_cv^-1(dEdx_CAF)                                at phi = 90 deg
+        dEdx_u = dEdx_CAF * R_u(q * c_cv / c_u) / R_cv(q)
+
+    with R the chain's recombination (``calo.recombination_cor``) and c ``c_cal_frac``. ``cv``
+    is the CAF value exactly, so LArSoft's hit selection is kept.
+
+    Energy is larpandora's ShowerNumElectronsEnergy: the plane's summed, lifetime-corrected
+    charge over the gain and a CONSTANT recombination factor (0.64). The charge scale is exact,
+    E_u ∝ c_cv / c_u, because the sum is linear in every hit's charge. Recombination has no
+    model in that estimate to vary, so a recombination universe scales the energy by the same
+    recombination-only ratio the dE/dx takes at the shower's start, on that plane or else on the
+    dE/dx best plane, and by 1 where neither has a dE/dx. That is an APPROXIMATION: the
+    shower's later hits are not at its start's dQ/dx.
+
+    Only a treatment without the per-hit chain qualifies: ``joint``'s stochastic smear does not
+    commute with a median. Data carries ``cv`` alone, as ``make_calo_df`` does.
+    """
+    spec = chi2pid.SBND_CALO_TREATMENTS[treatment]
+    if spec["calo_chain"]:
+        raise ValueError(f"treatment {treatment!r} has per-hit rungs that do not commute with the "
+                         "shower dE/dx median; only a chain-free treatment can be inverted")
+    hdrdf = make_mchdrdf(f)
+    if hdrdf.empty:
+        return pd.DataFrame()
+    ismc = hdrdf.ismc.iloc[0]
+    universes = spec["universes"] if ismc else {"cv": spec["universes"]["cv"]}
+
+    frame = _shower_branches(f, SHOWER_CALO_INPUTS)
+    if frame.empty:
+        return pd.DataFrame()
+    from makedf import calo
+
+    phi = np.pi / 2
+    efield, rho = calo.Efield_sbnd, calo.LAr_density_gmL_sbnd
+    cv = universes["cv"][0]
+    rec_cv = _recombination(cv)
+    best = frame["bestplane_for_dedx"].to_numpy()
+
+    def positive(values):
+        values = np.asarray(values, dtype=float)
+        return np.where(values > 0, values, np.nan)
+
+    dedx = {p: positive(frame[f"dEdx_I{p}"]) for p in range(3)}
+    energy = {p: positive(frame[f"energy_I{p}"]) for p in range(3)}
+    best_dedx = np.full(len(frame), np.nan)
+    for p in range(3):
+        best_dedx = np.where(best == p, dedx[p], best_dedx)
+
+    columns = {}
+    for name, (params, _, _) in universes.items():
+        rec_u = _recombination(params)
+        for p in range(3):
+            if name == "cv":
+                columns[f"shw_dEdx_I{p}_cv"] = dedx[p]
+                columns[f"shw_energy_I{p}_cv"] = energy[p]
+                continue
+            scale = cv["c_cal_frac"][p] / params["c_cal_frac"][p]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                q = calo.recombination(dedx[p], phi, efield, rho, **rec_cv)
+                columns[f"shw_dEdx_I{p}_{name}"] = (
+                    dedx[p] * calo.recombination_cor(q * scale, phi, efield, rho, **rec_u)
+                    / calo.recombination_cor(q, phi, efield, rho, **rec_cv))
+                start = np.where(np.isfinite(dedx[p]), dedx[p], best_dedx)
+                q_start = calo.recombination(start, phi, efield, rho, **rec_cv)
+                recomb = (calo.recombination_cor(q_start, phi, efield, rho, **rec_u)
+                          / calo.recombination_cor(q_start, phi, efield, rho, **rec_cv))
+            recomb = np.where(np.isfinite(recomb), recomb, 1.0)
+            columns[f"shw_energy_I{p}_{name}"] = energy[p] * scale * recomb
+
+    out = pd.DataFrame(columns, index=frame.index).astype("float32")
+    return out.rename_axis([CALO_LEVEL_ALIASES.get(n, n) for n in out.index.names]).sort_index()
+
+
+def make_shower_calo_default_df(f: dict) -> pd.DataFrame:
+    """The ``default`` treatment's shower universes. For a config's ``DFS``."""
+    return make_shower_calo_df(f, "default")
