@@ -29,3 +29,6 @@ from makedf.makedf import make_hdrdf
 
 DFS = [make_pfp_geom_df, make_hdrdf, make_file_df]
 NAMES = ["geom", "hdr", "file"]
+
+# kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
+COMPLIB, COMPLEVEL = "blosc:zstd", 4

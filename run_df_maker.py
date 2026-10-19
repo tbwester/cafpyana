@@ -56,7 +56,10 @@ def run_pool(output, inputs, nproc):
     output = pathlib.Path(output).with_suffix('.df')
     k_idx = 0
     split_margin = args.SplitSize
-    with pd.HDFStore(output, complevel=4, complib="blosc") as hdf_pd:
+    # A config may set COMPLIB and COMPLEVEL, as it may set PREPROCESS.
+    complib = globals().get("COMPLIB", "blosc")
+    complevel = globals().get("COMPLEVEL", 4)
+    with pd.HDFStore(output, complevel=complevel, complib=complib) as hdf_pd:
         NAMES.append("histpotdf")
         NAMES.append("histgenevtdf")
         size_counters = {k: 0 for k in NAMES}

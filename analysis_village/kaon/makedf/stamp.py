@@ -29,8 +29,9 @@ from pathlib import Path
 import numpy as np
 
 #: The kaon product format, bumped on any change to a kaon table's columns, index, or
-#: meaning. 4 is the first stamped format (kaonana v4).
-KAON_FORMAT = np.int16(4)
+#: meaning. 4 is the first stamped format (kaonana v4); 5 adds the AV row preselection,
+#: the dropped and narrowed columns, the per-group syst tables and the beam table (kaonana v5).
+KAON_FORMAT = np.int16(5)
 
 #: ``producer_commit`` when no commit could be determined.
 UNKNOWN_COMMIT = np.uint64(0)

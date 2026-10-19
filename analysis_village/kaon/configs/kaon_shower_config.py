@@ -23,3 +23,6 @@ from makedf.makedf import make_hdrdf
 
 DFS = [make_shower_df, make_hdrdf, make_file_df]
 NAMES = ["shower", "hdr", "file"]
+
+# kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
+COMPLIB, COMPLEVEL = "blosc:zstd", 4

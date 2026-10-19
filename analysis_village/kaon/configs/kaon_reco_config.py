@@ -10,9 +10,8 @@ They are deltas about a chosen central value, so carrying one ``cv`` per product
 makes two calorimetry treatments impossible to hold side by side; and they were
 **81% of a product's bytes**, 108 columns on ``track`` and 240 duplicated onto
 ``pair``'s two legs.  They are now ``kaon_calo_config``, joined on
-``(file_key, entry, rec.slc..index, pfp_index)``.  What stays here is the twelve
-BARE ``chi2_{hyp}_I{plane}`` columns LArSoft itself wrote, which are the
-regression check that the chain reproduces the CAF.
+``(file_key, entry, rec.slc..index, pfp_index)``.  The CAF's own bare
+``chi2_{hyp}_I{plane}`` columns are not written (kaon_format 5): nothing read them.
 
 Not ``kaon_train_config``, which also drops ``syst``: that one additionally drops
 ``true_kaon``, which the analysis export carries, and warns against merging its
@@ -28,6 +27,7 @@ selection scan.
 """
 
 from analysis_village.kaon.makedf.make_kaon_df import (
+    make_beam_df,
     make_file_df,
     make_pair_df,
     make_slice_df,
@@ -37,6 +37,10 @@ from analysis_village.kaon.makedf.make_kaon_df import (
 )
 from makedf.makedf import make_hdrdf
 
+# beam is data's per-spill POT; MC and EXT write it empty, so one config serves every stream.
 DFS = [make_true_type_df, make_true_kaon_df, make_slice_df,
-       make_track_df, make_pair_df, make_hdrdf, make_file_df]
-NAMES = ["true_type", "true_kaon", "slice", "track", "pair", "hdr", "file"]
+       make_track_df, make_pair_df, make_beam_df, make_hdrdf, make_file_df]
+NAMES = ["true_type", "true_kaon", "slice", "track", "pair", "beam", "hdr", "file"]
+
+# kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
+COMPLIB, COMPLEVEL = "blosc:zstd", 4

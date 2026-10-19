@@ -8,7 +8,7 @@ import pyanalib.pandas_helpers as ph
 import numpy as np
 import pandas as pd
 from makedf import chi2pid
-from makedf.makedf import make_mchdrdf, make_trkhitdf
+from makedf.makedf import make_mchdrdf, make_potdf_bnb, make_trkhitdf
 
 from . import range_momentum
 from .provenance import UNKNOWN_FILE_KEY, file_key
@@ -24,9 +24,7 @@ TRUE_KE_CUT = 0.
 #
 # Thresholds approximate SBND reconstruction thresholds; they are deliberately
 # fixed rather than tuned. A cut of 0. means "count all":
-#   pi0/Lambda  decay immediately, the daughters carry the real threshold
-#   neutron     not reconstructable; stored for truth bookkeeping only, do NOT
-#               use it in a "matched final state" definition
+#   pi0         decays immediately, the daughters carry the real threshold
 #   kaons       true kaon KE is stored separately (true_E_kaon/true_P_kaon), so
 #               the kaon threshold is applied downstream, on the fly
 PRIM_SPECIES = {
@@ -39,16 +37,48 @@ PRIM_SPECIES = {
     "n_klong":   (  130, 0.497611, 0.0),
     "n_kshort":  (  310, 0.497611, 0.0),
     "n_proton":  ( 2212, 0.938272, 0.050),
-    "n_neutron": ( 2112, 0.939565, 0.0),
     "n_mu":      (   13, 0.105658, 0.025),
     "n_mubar":   (  -13, 0.105658, 0.025),
     "n_e":       (   11, 0.000511, 0.010),
     "n_ebar":    (  -11, 0.000511, 0.010),
     "n_gamma":   (   22, 0.0,      0.010),
-    "n_lambda":  ( 3122, 1.115683, 0.0),
 }
 
 InFV_SBND = functools.partial(util.InFV, inzback=np.nan, det='SBND')
+
+
+# --- row preselection (kaon_format 5) -----------------------------------------
+# Per-pfp tables keep the non-clear-cosmic slices with a reco vertex in `util.InAV`; syst keeps
+# the neutrinos such a slice matches, the true-FV ones, and any with a true K+ (kaonana v5 D1).
+# This couples syst to reco: a reco respin that moves slice vertices needs a syst respin.
+
+#: The two slice levels of a single-file frame, as `loadbranches` names them.
+SLICE_LEVELS = ("entry", "rec.slc..index")
+
+#: One file's preselected slices, cached on the recTree as `_HIT_CACHE` is.
+_SLICE_CACHE = {"recTree": None, "slices": None}
+
+
+def kept_slices(f) -> pd.DataFrame:
+    """This file's preselected slices, indexed by `SLICE_LEVELS`, with their `tmatch_idx`."""
+    tree = f["recTree"]
+    if _SLICE_CACHE["recTree"] is not tree:
+        slc = ph.loadbranches(tree, [
+            "rec.slc.is_clear_cosmic", "rec.slc.tmatch.index",
+            "rec.slc.vertex.x", "rec.slc.vertex.y", "rec.slc.vertex.z"]).rec.slc
+        slc.columns = ["_".join(str(c) for c in col if c) for col in slc.columns]
+        vertex = slc[["vertex_x", "vertex_y", "vertex_z"]].set_axis(["x", "y", "z"], axis=1)
+        keep = (slc["is_clear_cosmic"] == 0) & util.InAV(vertex).fillna(False)
+        kept = pd.DataFrame({"tmatch_idx": slc["tmatch_idx"][keep]})
+        kept.index = kept.index.set_names(list(SLICE_LEVELS))
+        _SLICE_CACHE["recTree"], _SLICE_CACHE["slices"] = tree, kept
+    return _SLICE_CACHE["slices"]
+
+
+def in_kept_slices(f, frame: pd.DataFrame) -> pd.DataFrame:
+    """The rows of *frame* (indexed on a slice and below) whose slice `kept_slices` keeps."""
+    keys = pd.MultiIndex.from_arrays([frame.index.get_level_values(n) for n in SLICE_LEVELS])
+    return frame[keys.isin(kept_slices(f).index)]
 
 # Decay modes, keyed by the sorted multiset of the PDGs of the kaon's decay
 # products. Recorded because true_type cannot express it: a three-body decay
@@ -653,8 +683,7 @@ def make_true_type_df(f) -> pd.DataFrame:
     # obvious spelling concludes the quantity is absent when it is not.
     nu_branches = ['rec.mc.nu.E', 'rec.mc.nu.iscc', 'rec.mc.nu.genie_mode',
                    'rec.mc.nu.position.x', 'rec.mc.nu.position.y', 'rec.mc.nu.position.z',
-                   'rec.mc.nu.w', 'rec.mc.nu.Q2', 'rec.mc.nu.bjorkenX',
-                   'rec.mc.nu.inelasticityY', 'rec.mc.nu.genie_inttype',
+                   'rec.mc.nu.w', 'rec.mc.nu.Q2', 'rec.mc.nu.genie_inttype',
                    'rec.mc.nu.targetPDG']
     mcdf = ph.loadbranches(f["recTree"], nu_branches).rec.mc.nu
 
@@ -703,14 +732,12 @@ def make_true_type_df(f) -> pd.DataFrame:
     res['genie_mode'] = mcdf['genie_mode'].fillna(-1).astype(int)
 
     # Interaction kinematics, as GENIE recorded them. float32 because that is
-    # the CAF's own storage class for all four and nothing here needs more.
+    # the CAF's own storage class and nothing here needs more.
     # Left UNFILLED, like true_E_nu above: an interaction with no GENIE record
     # has no W, and NaN says so where a sentinel would have to be excluded by
     # hand at every use.
     res['true_W'] = mcdf['w'].astype('float32')
     res['true_Q2'] = mcdf['Q2'].astype('float32')
-    res['true_bjorken_x'] = mcdf['bjorkenX'].astype('float32')
-    res['true_inelasticity_y'] = mcdf['inelasticityY'].astype('float32')
 
     # The two integer kinematics, filled like genie_mode because an integer
     # column cannot hold NaN.
@@ -792,11 +819,13 @@ def make_true_type_df(f) -> pd.DataFrame:
     # reconstruct the true_type decision downstream.
     keep_cols = (['true_type', 'is_cc', 'genie_mode', 'is_true_fv', 'is_k_contained',
                   'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions',
-                  'true_W', 'true_Q2', 'true_bjorken_x', 'true_inelasticity_y',
-                  'genie_inttype', 'target_pdg']
+                  'true_W', 'true_Q2', 'genie_inttype', 'target_pdg']
                  + list(KORIGIN_COUNT_COLS.values())
                  + list(PRIM_SPECIES))
-    return res[keep_cols]
+    # Small enumerations and counters: true_type is 1-99, the rest are far below 32767.
+    narrow = {'true_type': 'int8', 'genie_mode': 'int16', 'n_k_interactions': 'int16',
+              **{c: 'int16' for c in [*KORIGIN_COUNT_COLS.values(), *PRIM_SPECIES]}}
+    return res[keep_cols].astype(narrow)
 
 
 
@@ -946,8 +975,137 @@ def make_slice_df(f: dict) -> pd.DataFrame:
 MULTISIM_NUNIV = 100
 
 
-def make_syst_df(f: dict) -> pd.DataFrame:
-    """Reweight systematics, **one row per true interaction**.
+#: The knob bases format 5 keeps, per table: what kaonana's definitions read, plus the excluded
+#: knobs and the multisigma duplicates a definition may switch to (kaonana
+#: ``scripts/production/syst_keep_list.py``, 4,261 of 5,465 columns). A column is kept when it
+#: starts with ``<base>_``. A knob outside these is not written, so a definition that adds one
+#: needs a syst respin.
+SYST_GROUPS = {'syst_genie': ('GENIEReWeight_SBN_v1_multisigma_AhtBY',
+                'GENIEReWeight_SBN_v1_multisigma_BhtBY',
+                'GENIEReWeight_SBN_v1_multisigma_CV1uBY',
+                'GENIEReWeight_SBN_v1_multisigma_CV2uBY',
+                'GENIEReWeight_SBN_v1_multisigma_CoulombCCQE',
+                'GENIEReWeight_SBN_v1_multisigma_EtaNCEL',
+                'GENIEReWeight_SBN_v1_multisigma_FrAbs_N',
+                'GENIEReWeight_SBN_v1_multisigma_FrAbs_pi',
+                'GENIEReWeight_SBN_v1_multisigma_FrCEx_N',
+                'GENIEReWeight_SBN_v1_multisigma_FrCEx_pi',
+                'GENIEReWeight_SBN_v1_multisigma_FrInel_N',
+                'GENIEReWeight_SBN_v1_multisigma_FrInel_pi',
+                'GENIEReWeight_SBN_v1_multisigma_FrPiProd_N',
+                'GENIEReWeight_SBN_v1_multisigma_FrPiProd_pi',
+                'GENIEReWeight_SBN_v1_multisigma_MFP_N',
+                'GENIEReWeight_SBN_v1_multisigma_MFP_pi',
+                'GENIEReWeight_SBN_v1_multisigma_MaCCRES',
+                'GENIEReWeight_SBN_v1_multisigma_MaNCEL',
+                'GENIEReWeight_SBN_v1_multisigma_MaNCRES',
+                'GENIEReWeight_SBN_v1_multisigma_MvCCRES',
+                'GENIEReWeight_SBN_v1_multisigma_MvNCRES',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarnCC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarnCC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarnNC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarnNC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarpCC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarpCC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarpNC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvbarpNC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvnCC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvnCC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvnNC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvnNC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvpCC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvpCC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvpNC1pi',
+                'GENIEReWeight_SBN_v1_multisigma_NonRESBGvpNC2pi',
+                'GENIEReWeight_SBN_v1_multisigma_NormCCCOH',
+                'GENIEReWeight_SBN_v1_multisigma_NormCCMEC',
+                'GENIEReWeight_SBN_v1_multisigma_NormNCCOH',
+                'GENIEReWeight_SBN_v1_multisigma_NormNCMEC',
+                'GENIEReWeight_SBN_v1_multisigma_RDecBR1eta',
+                'GENIEReWeight_SBN_v1_multisigma_RDecBR1gamma',
+                'GENIEReWeight_SBN_v1_multisigma_RPA_CCQE',
+                'GENIEReWeight_SBN_v1_multisigma_ZExpA1CCQE',
+                'GENIEReWeight_SBN_v1_multisigma_ZExpA2CCQE',
+                'GENIEReWeight_SBN_v1_multisigma_ZExpA3CCQE',
+                'GENIEReWeight_SBN_v1_multisigma_ZExpA4CCQE',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarnCC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarnCC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarnNC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarnNC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarpCC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarpCC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarpNC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvbarpNC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvnCC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvnCC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvnNC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvnNC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvpCC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvpCC2pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvpNC1pi',
+                'GENIEReWeight_SBN_v1_multisim_NonRESBGvpNC2pi',
+                'GENIEReWeight_SBN_v1_multisim_RDecBR1eta',
+                'GENIEReWeight_SBN_v1_multisim_RDecBR1gamma'),
+ 'syst_flux': ('expskin_Flux',
+               'horncurrent_Flux',
+               'kminus_Flux',
+               'kplus_Flux',
+               'kzero_Flux',
+               'nucleoninexsec_Flux',
+               'nucleonqexsec_Flux',
+               'nucleontotxsec_Flux',
+               'piminus_Flux',
+               'pioninexsec_Flux',
+               'pionqexsec_Flux',
+               'piontotxsec_Flux',
+               'piplus_Flux'),
+ 'syst_g4': ('reinteractions_kminus_Geant4',
+             'reinteractions_kplus_Geant4',
+             'reinteractions_neutron_Geant4',
+             'reinteractions_piminus_Geant4',
+             'reinteractions_piplus_Geant4',
+             'reinteractions_proton_Geant4'),
+ 'syst_misc': ('MINERvAE2p2h_SBN_v1_E2p2h_A_nu',
+               'MINERvAE2p2h_SBN_v1_E2p2h_A_nubar',
+               'MINERvAE2p2h_SBN_v1_E2p2h_B_nu',
+               'MINERvAE2p2h_SBN_v1_E2p2h_B_nubar',
+               'MINERvAq0q3Weighting_SBN_v1_Mnv2p2hGaussEnhancement',
+               'MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nu',
+               'MiscInteractionSysts_SBN_v1_C12ToAr40_2p2hScaling_nubar',
+               'MiscInteractionSysts_SBN_v1_SPPLowQ2Suppression',
+               'MiscInteractionSysts_SBN_v1_nuenuebar_xsec_ratio',
+               'MiscInteractionSysts_SBN_v1_nuenumu_xsec_ratio',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_CC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_n_NC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_np_CC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_CC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nu_p_NC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_CC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_n_NC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_CC_3Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_1Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_2Pi',
+               'NOvAStyleNonResPionNorm_SBN_v1_NR_nubar_p_NC_3Pi')}
+
+#: One file's preselected, flattened syst table, cached on the recTree as `_HIT_CACHE` is, so the
+#: four group makers below decode the weights once.
+_SYST_CACHE = {"recTree": None, "systs": None}
+
+
+def _syst_rows(f) -> pd.DataFrame:
+    """Every kept knob column, on the neutrinos the preselection keeps (see `kept_slices`).
 
     Indexed ``(entry, rec.mc.nu..index)`` -- the same leading levels as
     ``make_true_type_df`` -- so it joins to truth directly and needs nothing from
@@ -978,24 +1136,83 @@ def make_syst_df(f: dict) -> pd.DataFrame:
     ``kaonana.analysis.selection.attach_true_type`` already does for
     ``true_type``.
     """
+    tree = f["recTree"]
+    if _SYST_CACHE["recTree"] is tree:
+        return _SYST_CACHE["systs"]
     systs = getsyst.get_all_syst_df(f, multisim_nuniv=MULTISIM_NUNIV)
-
     if systs is None or systs.empty:
+        systs = pd.DataFrame(index=_empty_index("entry", "rec.mc.nu..index"))
+    else:
+        if isinstance(systs.columns, pd.MultiIndex):
+            systs.columns = ["_".join([str(c) for c in col if c]).strip()
+                             for col in systs.columns.values]
+        # get_all_syst_df indexes (entry, inu); rename to the products' MC convention
+        # so the table lines up with true_type and true_kaon without a translation.
+        systs.index.names = ["entry", "rec.mc.nu..index"]
+        bases = tuple(f"{b}_" for group in SYST_GROUPS.values() for b in group)
+        systs = systs[[c for c in systs.columns if c.startswith(bases)]]
+
+        position = ph.loadbranches(tree, [f"rec.mc.nu.position.{c}" for c in "xyz"]).rec.mc.nu
+        true_fv = InFV_SBND(position["position"]).fillna(False)
+        true_fv = true_fv.reindex(systs.index, fill_value=False).to_numpy()
+        kept = kept_slices(f)
+        matched = kept[kept["tmatch_idx"] >= 0]
+        matched = pd.MultiIndex.from_arrays(
+            [matched.index.get_level_values("entry"), matched["tmatch_idx"].astype(int)])
+        tp = _flat_true_particles(_true_particles(f))
+        tp = tp[(tp["pdg"] == KPDG["kplus"]) & (tp["interaction_id"] >= 0)]
+        kaon = pd.MultiIndex.from_arrays([tp["entry"], tp["interaction_id"].astype(int)])
+        systs = systs[true_fv | systs.index.isin(matched) | systs.index.isin(kaon)].sort_index()
+    _SYST_CACHE["recTree"], _SYST_CACHE["systs"] = tree, systs
+    return systs
+
+
+def _syst_group_df(f, table: str) -> pd.DataFrame:
+    systs = _syst_rows(f)
+    bases = tuple(f"{b}_" for b in SYST_GROUPS[table])
+    return systs[[c for c in systs.columns if c.startswith(bases)]]
+
+
+def make_syst_genie_df(f):
+    """The GENIE knobs of `SYST_GROUPS`. For a config's ``DFS``."""
+    return _syst_group_df(f, "syst_genie")
+
+
+def make_syst_flux_df(f):
+    """The flux knobs of `SYST_GROUPS`. For a config's ``DFS``."""
+    return _syst_group_df(f, "syst_flux")
+
+
+def make_syst_g4_df(f):
+    """The Geant4 reinteraction knobs of `SYST_GROUPS`. For a config's ``DFS``."""
+    return _syst_group_df(f, "syst_g4")
+
+
+def make_syst_misc_df(f):
+    """The misc SBN interaction knobs of `SYST_GROUPS`. For a config's ``DFS``."""
+    return _syst_group_df(f, "syst_misc")
+
+
+def _empty_index(*names) -> pd.MultiIndex:
+    """A zero-row integer MultiIndex. Built from empty lists, the levels are object dtype, which
+    format="fixed" pickles at ~1 MB a block."""
+    return pd.MultiIndex.from_arrays([np.array([], dtype=np.int64)] * len(names), names=names)
+
+
+def make_beam_df(f) -> pd.DataFrame:
+    """One row per BNB spill: the toroid POT, TOR860 and TOR875, from ``make_potdf_bnb``.
+
+    Data only; MC and EXT carry no spills and give an empty table. Indexed ``(entry, spill)``,
+    so ``hdr`` gives each spill its run and subrun. ``hdr.pot`` is the subrun's TOR875 sum and
+    ``hdr.nbnbinfo`` / ``hdr.noffbeambnb`` are the spill counts (kaonana unblinding B4).
+    """
+    beam = make_potdf_bnb(f)
+    if beam.empty:
         return pd.DataFrame(
-            index=pd.MultiIndex.from_arrays(
-                [[], []], names=["entry", "rec.mc.nu..index"]
-            )
-        )
-
-    # Flatten MultiIndex columns of systs if they are tuples
-    if isinstance(systs.columns, pd.MultiIndex):
-        systs.columns = ["_".join([str(c) for c in col if c]).strip() for col in systs.columns.values]
-
-    # get_all_syst_df indexes (entry, inu); rename to the products' MC convention
-    # so the table lines up with true_type and true_kaon without a translation.
-    systs.index.names = ["entry", "rec.mc.nu..index"]
-
-    return systs.sort_index()
+            {"TOR860": pd.Series(dtype="float64"), "TOR875": pd.Series(dtype="float64")},
+            index=_empty_index("entry", "spill"))
+    beam.columns = [c if isinstance(c, str) else next(n for n in c if n) for c in beam.columns]
+    return beam.rename_axis(["entry", "spill"])
 
 def _extract_base_track_df(f: dict):
     """
@@ -1011,18 +1228,6 @@ def _extract_base_track_df(f: dict):
         'rec.slc.reco.pfp.trk.end.x',
         'rec.slc.reco.pfp.trk.end.y',
         'rec.slc.reco.pfp.trk.end.z',
-        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_kaon',
-        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_kaon',
-        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_kaon',
-        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_muon',
-        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_muon',
-        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_muon',
-        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_proton',
-        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_proton',
-        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_proton',
-        'rec.slc.reco.pfp.trk.chi2pid.0.chi2_pion',
-        'rec.slc.reco.pfp.trk.chi2pid.1.chi2_pion',
-        'rec.slc.reco.pfp.trk.chi2pid.2.chi2_pion',
         # Range-momentum under the pion hypothesis. Not used by any selection --
         # it is the closure reference for trk_rangeP_kaon, which we compute
         # ourselves because caf::SRTrkRange has no kaon slot. sbncode builds
@@ -1063,14 +1268,7 @@ def _extract_base_track_df(f: dict):
     slice_idx_names = list(pandora_df.index.names)[:-1]
     pfp_idx_col = pandora_df.index.names[-1]
 
-    # PRE-CUT: Drop clear cosmics to save space
-    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
-    if isinstance(slc_df.columns, pd.MultiIndex):
-        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
-    is_cosmic = slc_df['is_clear_cosmic'] == 1
-    levels_to_drop = list(range(is_cosmic.index.nlevels, pandora_df.index.nlevels))
-    is_cosmic_aligned = is_cosmic.reindex(pandora_df.index.droplevel(levels_to_drop))
-    pandora_df = pandora_df[~is_cosmic_aligned.values]
+    pandora_df = in_kept_slices(f, pandora_df)
 
     # loadbranches sets the column arity from the DEEPEST branch requested and
     # pads everything shallower with trailing "". So adding a branch one level
@@ -1093,14 +1291,8 @@ def _extract_base_track_df(f: dict):
             raise ValueError(f"column key {parts} is deeper than the frame ({_depth} levels)")
         return tuple(parts) + ("",) * (_depth - len(parts))
 
-    # The calorimetry chi2 columns are NOT built here any more (kaonana CALO.199).  They are
-    # their own product tier, `make_calo_df`, so that a calorimetry re-derivation does not
-    # require a reco reprocessing and so that several TREATMENTS can be carried against one
-    # reco pass.  What stays is the twelve BARE `chi2_{par}_I{plane}` columns the CAF itself
-    # wrote: those are LArSoft's, not this chain's, and they are the regression check that the
-    # chain reproduces the CAF.  `make_pair_df` copies whatever `chi2*` columns this frame
-    # carries onto both legs, so dropping the universes here drops 240 duplicated columns
-    # there as well -- 81% of a reco product, measured.
+    # No chi2 here: the calorimetry chi2 is the calo tier's (`make_calo_df`, kaonana CALO.199),
+    # and the CAF's own bare `chi2_{par}_I{plane}` columns had no reader (kaon_format 5).
 
     flat_df = pandora_df.loc[:, ~pandora_df.columns.duplicated()].reset_index(level=pfp_idx_col)
 
@@ -1115,18 +1307,6 @@ def _extract_base_track_df(f: dict):
         _key("pfp", "trk", "end", "z"): "end_z",
         _key("pfp", "trackScore"): "trackScore",
         _key("pfp", "trk", "len"): "trk_len",
-        _key("pfp", "trk", "chi2pid", "I0", "chi2_kaon"): "chi2_kaon_I0",
-        _key("pfp", "trk", "chi2pid", "I0", "chi2_muon"): "chi2_muon_I0",
-        _key("pfp", "trk", "chi2pid", "I0", "chi2_proton"): "chi2_proton_I0",
-        _key("pfp", "trk", "chi2pid", "I1", "chi2_kaon"): "chi2_kaon_I1",
-        _key("pfp", "trk", "chi2pid", "I1", "chi2_muon"): "chi2_muon_I1",
-        _key("pfp", "trk", "chi2pid", "I1", "chi2_proton"): "chi2_proton_I1",
-        _key("pfp", "trk", "chi2pid", "I2", "chi2_kaon"): "chi2_kaon_I2",
-        _key("pfp", "trk", "chi2pid", "I2", "chi2_muon"): "chi2_muon_I2",
-        _key("pfp", "trk", "chi2pid", "I2", "chi2_proton"): "chi2_proton_I2",
-        _key("pfp", "trk", "chi2pid", "I0", "chi2_pion"): "chi2_pion_I0",
-        _key("pfp", "trk", "chi2pid", "I1", "chi2_pion"): "chi2_pion_I1",
-        _key("pfp", "trk", "chi2pid", "I2", "chi2_pion"): "chi2_pion_I2",
         _key("pfp", "trk", "rangeP", "p_pion"): "trk_rangeP_pion",
         _key("pfp", "trk", "truth", "p", "pdg"): "truth_pdg",
         _key("pfp", "trk", "truth", "p", "G4ID"): "truth_G4ID",
@@ -1142,10 +1322,6 @@ def _extract_base_track_df(f: dict):
         pfp_col_key: "pfp_index",
     }
 
-    # No per-universe entries here: the chi2 universes are `make_calo_df`'s, keyed on the same
-    # track and joined by `(file_key, entry, rec.slc..index, pfp_index)`.  The BARE CAF columns
-    # above stay.
-
     cols_to_keep = {k: v for k, v in col_map.items() if k in flat_df.columns}
     clean_df = flat_df[list(cols_to_keep.keys())].copy()
     clean_df.columns = list(cols_to_keep.values())
@@ -1160,10 +1336,8 @@ def _extract_base_track_df(f: dict):
     #                            interaction" is the only distinction that
     #                            matters downstream; truth_pdg == 0 still
     #                            separates unmatched from genuinely cosmic
-    #   truth_parent -1  NOT 0: G4 uses parent == 0 for a primary, so mapping
-    #                    unmatched onto 0 would make an unmatched track read as
-    #                    the child of a primary. -1 is already the CAF's
-    #                    "not from a neutrino interaction" value.
+    #   truth_parent     the CAF's uint32, unmatched 4294967295, stored as is.
+    #                    A primary's parent is its G4 block base (1e7), not 0.
     #   truth_genE NaN  already NaN out of the CAF, left alone
     #   truth_start_*, truth_end_*  float, and left alone for the same reason
     #                    as genE. If a build ever does put INT_MIN in them the
@@ -1171,10 +1345,12 @@ def _extract_base_track_df(f: dict):
     #                    an unmatched track reads as uncontained and cannot be
     #                    labelled signal.
     _unmatched = np.iinfo(np.int32).min
-    for _col, _fill in (("truth_pdg", 0), ("truth_G4ID", 0), ("truth_parent", -1),
-                        ("truth_interaction_id", -1)):
+    for _col, _fill in (("truth_pdg", 0), ("truth_G4ID", 0), ("truth_interaction_id", -1)):
         if _col in clean_df.columns:
-            clean_df[_col] = clean_df[_col].replace(_unmatched, _fill).astype(int)
+            clean_df[_col] = clean_df[_col].replace(_unmatched, _fill).astype("int32")
+    # The CAF's truth.p.parent is uint32, unmatched 4294967295, so INT_MIN never occurs in it.
+    if "truth_parent" in clean_df.columns:
+        clean_df["truth_parent"] = clean_df["truth_parent"].astype("uint32")
 
     # Range-momentum under the KAON hypothesis, which the CAF does not carry:
     # caf::SRTrkRange has p_muon/p_pion/p_proton and no kaon slot, and adding one
@@ -1265,10 +1441,6 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
         "end_z": "end_z",
         "trk_len": "parent_len",
     }
-    for c in track_df.columns:
-        if c.startswith(("chi2", "truth_")):
-            p_rename[c] = f"parent_{c}"
-
     p_df = track_df[list(p_rename.keys())].copy()
     p_df.columns = list(p_rename.values())
     p_df.index.names = [*slice_idx_names, "parent_pfp_index"]
@@ -1280,10 +1452,6 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
         "start_z": "start_z",
         "trk_len": "daughter_len",
     }
-    for c in track_df.columns:
-        if c.startswith(("chi2", "truth_")):
-            d_rename[c] = f"daughter_{c}"
-
     d_df = track_df[list(d_rename.keys())].copy()
     d_df.columns = list(d_rename.values())
     d_df.index.names = [*slice_idx_names, "daughter_pfp_index"]
@@ -1304,21 +1472,13 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
     dist = np.sqrt(dx**2 + dy**2 + dz**2)
     pairs["dist_to_parent_end"] = dist
 
-    close_pairs = pairs[dist < proximity_cm].copy()
+    close_pairs = pairs[dist < proximity_cm]
     if close_pairs.empty:
         return pd.DataFrame()
 
-    # 5. Multiplicity
-    multiplicity = close_pairs.groupby([*slice_idx_names, "parent_pfp_index"]).size().rename("n_close_to_parent_end")
-    close_pairs = close_pairs.reset_index().merge(
-        multiplicity.reset_index(),
-        on=[*slice_idx_names, "parent_pfp_index"],
-        how="left"
-    )
-
-    # 6. Finalize
-    final_idx = [*slice_idx_names, "parent_pfp_index", "daughter_pfp_index"]
-    pair_df = close_pairs.set_index(final_idx).sort_index()
+    # 5. Finalize. Each leg's truth is track's, joined on its pfp index (kaon_format 5).
+    pair_df = close_pairs.set_index(["parent_pfp_index", "daughter_pfp_index"], append=True)
+    pair_df = pair_df.sort_index()
 
     return pair_df
 
@@ -1343,7 +1503,7 @@ def make_pair_df(f: dict, proximity_cm: float = 5.0) -> pd.DataFrame:
 # and p_proton reproduce the CAF's own columns from trk_len to 7e-08 in ratio, so storing
 # them would store a function of a column already exported.
 #
-# No cut is applied beyond the clear-cosmic drop that `track` also applies. A gated
+# No cut is applied beyond the slice preselection `track` also takes. A gated
 # variant was tried and measured first -- gating on the 1mu1p topology keeps 17-27% of
 # track rows, because two or three primary tracks with a 30 cm tag is a common topology
 # rather than a rare one -- so it would have bounded every later study of its own gate to
@@ -1436,9 +1596,6 @@ def make_calo_df(f: dict, treatment: str = "joint") -> pd.DataFrame:
     the same flatcafs differently and an index join across the two is wrong while looking right.
     A `*_calo` product therefore carries `file` and `hdr` as well, giving `(file_key, entry)`;
     `kaonana.schema.CALO_TABLES` declares it and `kaonana.data.samples.event_key_frame` builds it.
-
-    The twelve bare `chi2_{hyp}_I{plane}` columns are NOT here -- they are LArSoft's own and stay
-    with `track`, where they are the regression check that this chain reproduces the CAF.
     """
     spec = chi2pid.SBND_CALO_TREATMENTS[treatment]
     hdrdf = make_mchdrdf(f)
@@ -1496,7 +1653,7 @@ def make_calo_df(f: dict, treatment: str = "joint") -> pd.DataFrame:
 
     if not columns:
         return pd.DataFrame()
-    frame = pd.DataFrame(columns)
+    frame = in_kept_slices(f, pd.DataFrame(columns))
     # A track with no hit in this plane's chi2 window has no ndof, which is 0 hits and not
     # "unknown" -- so it is filled rather than left NaN.  int16 against a bound of ~100 hits in
     # 26 cm (the observed maximum on kdev is 108): three orders of margin, and unlike a PDG
@@ -1553,8 +1710,8 @@ def make_pfp_geom_df(f: dict) -> pd.DataFrame:
     ``hdr`` and ``file`` ship alongside, exactly as they do for ``kaon_syst_config``: the key
     that survives is ``(file_key, entry)``.
 
-    Clear cosmics are dropped, matching ``make_track_df`` -- a row ``track`` does not have
-    would join to nothing anyway, and it is a large fraction of the pfps. A shower-like pfp
+    The slice preselection (`kept_slices`) applies, matching ``make_track_df`` -- a row
+    ``track`` does not have would join to nothing anyway. A shower-like pfp
     is **kept**, with NaN directions, because what else Pandora put in the slice is part of
     how a topology cut gets checked.
     """
@@ -1566,11 +1723,7 @@ def make_pfp_geom_df(f: dict) -> pd.DataFrame:
     frame.columns = ['.'.join(n for n in c if n != '') for c in frame.columns]
     frame = frame[list(PFP_GEOM_COLUMNS)].rename(columns=PFP_GEOM_COLUMNS)
 
-    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
-    if isinstance(slc_df.columns, pd.MultiIndex):
-        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
-    is_cosmic = (slc_df['is_clear_cosmic'] == 1).reindex(frame.index.droplevel(-1))
-    frame = frame[~is_cosmic.to_numpy()]
+    frame = in_kept_slices(f, frame)
     if frame.empty:
         return pd.DataFrame()
 
@@ -1697,7 +1850,7 @@ def _shower_origin(truth: pd.DataFrame, tpartdf: pd.DataFrame) -> pd.DataFrame:
 
 
 def _shower_branches(f: dict, columns: dict) -> pd.DataFrame:
-    """*columns*' branches per pfp, renamed, clear cosmics dropped as ``make_track_df`` does."""
+    """*columns*' branches per pfp, renamed, on the preselected slices (`kept_slices`)."""
     frame = ph.loadbranches(f["recTree"], [f"rec.slc.reco.{b}" for b in columns]).rec.slc.reco
     if frame.empty:
         return pd.DataFrame()
@@ -1706,11 +1859,7 @@ def _shower_branches(f: dict, columns: dict) -> pd.DataFrame:
     frame.columns = [c.replace(".plane.I", ".plane.") for c in frame.columns]
     frame = frame[list(columns)].rename(columns=columns)
 
-    slc_df = ph.loadbranches(f["recTree"], ['rec.slc.is_clear_cosmic']).rec.slc
-    if isinstance(slc_df.columns, pd.MultiIndex):
-        slc_df.columns = ["_".join([str(c) for c in col if c]).strip() for col in slc_df.columns.values]
-    is_cosmic = (slc_df['is_clear_cosmic'] == 1).reindex(frame.index.droplevel(-1))
-    frame = frame[~is_cosmic.to_numpy()]
+    frame = in_kept_slices(f, frame)
     frame.index = frame.index.set_names([*frame.index.names[:-1], "pfp_index"])
     return frame
 
@@ -1718,8 +1867,8 @@ def _shower_branches(f: dict, columns: dict) -> pd.DataFrame:
 def make_shower_df(f: dict) -> pd.DataFrame:
     """One row per pfp: the CAF's shower fit, and what its best match came from.
 
-    Keyed as ``make_track_df`` is, ``(entry, rec.slc..index, pfp_index)``, clear cosmics
-    dropped; every pfp is kept, track-like or not, because which pfps are photons is the
+    Keyed as ``make_track_df`` is, ``(entry, rec.slc..index, pfp_index)``, on the preselected
+    slices; every pfp is kept, track-like or not, because which pfps are photons is the
     analysis' cut. ``hdr`` and ``file`` ship alongside for the ``(file_key, entry)`` join.
 
     The CAF's -5 / -999 on the non-negative quantities become NaN (``SHOWER_NONNEGATIVE``);

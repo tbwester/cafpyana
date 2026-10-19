@@ -83,3 +83,6 @@ from makedf.makedf import make_hdrdf
 
 DFS = [make_calo_default_df, make_calo_joint_df, make_calo_stochastic_df, make_hdrdf, make_file_df]
 NAMES = ["calo_default", "calo_joint", "calo_stochastic", "hdr", "file"]
+
+# kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
+COMPLIB, COMPLEVEL = "blosc:zstd", 4

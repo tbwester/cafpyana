@@ -27,8 +27,20 @@ DO NOT merge these products with pass-1 products.  They have disjoint table sets
 and a different index granularity; they are joined, not concatenated.
 """
 
-from analysis_village.kaon.makedf.make_kaon_df import make_file_df, make_syst_df
+from analysis_village.kaon.makedf.make_kaon_df import (
+    make_file_df,
+    make_syst_flux_df,
+    make_syst_g4_df,
+    make_syst_genie_df,
+    make_syst_misc_df,
+)
 from makedf.makedf import make_hdrdf
 
-DFS = [make_syst_df, make_hdrdf, make_file_df]
-NAMES = ["syst", "hdr", "file"]
+# One table per knob group (make_kaon_df.SYST_GROUPS), so a reader of one group never
+# decompresses the others: run_df_maker writes format="fixed", which cannot project columns.
+DFS = [make_syst_genie_df, make_syst_flux_df, make_syst_g4_df, make_syst_misc_df,
+       make_hdrdf, make_file_df]
+NAMES = ["syst_genie", "syst_flux", "syst_g4", "syst_misc", "hdr", "file"]
+
+# kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
+COMPLIB, COMPLEVEL = "blosc:zstd", 4
