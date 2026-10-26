@@ -37,11 +37,11 @@ if [[ $machine == *jupyter* ]]; then
   mkdir -p $CAFPYANA_GRID_OUT_DIR
   mkdir -p $CAFPYANA_TMP_SCRATCH
 fi
-spack load /fucmza5 # hdf5@1.12.2%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
-spack load /oe726is # xrootd@5.6.9%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
+spack load /bnmkgjf # hdf5@1.12.2%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
+spack load /wrvy2k7 # xrootd@5.6.9%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
 
 # this sets Python to 3.10.16
-spack load root/vgs6mjs
+# spack load root/mtl4cff
 
 # EAF has different library needs
 EAF=0
