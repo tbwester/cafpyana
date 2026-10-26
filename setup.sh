@@ -11,7 +11,8 @@ spack load sam-web-client@3.6%gcc@11.4.1
 
 which samweb > /dev/null 2>&1 && echo "SAMWeb client set up" || echo "Warning: SAMWeb client not set up"
 
-SPACK_ROOT="/cvmfs/larsoft.opensciencegrid.org/spack-fnal-v1.1.1/setup-env.sh"
+SPACK_ROOT="/cvmfs/larsoft.opensciencegrid.org/setup-env.sh"
+
 if [[ $machine == *sbnd* ]]; then
   echo "working on a sbnd machine"
   source "${SPACK_ROOT}"
@@ -40,7 +41,7 @@ spack load /fucmza5 # hdf5@1.12.2%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
 spack load /oe726is # xrootd@5.6.9%gcc@12.5.0 arch=linux-almalinux9-x86_64_v2
 
 # this sets Python to 3.10.16
-spack load root arch=linux-almalinux9-x86_64_v2
+spack load root/vgs6mjs
 
 # EAF has different library needs
 EAF=0
