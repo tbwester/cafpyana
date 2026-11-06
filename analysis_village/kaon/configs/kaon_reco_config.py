@@ -32,15 +32,18 @@ from analysis_village.kaon.makedf.make_kaon_df import (
     make_pair_df,
     make_slice_df,
     make_track_df,
+    make_trigger_spill_df,
     make_true_kaon_df,
     make_true_type_df,
 )
 from makedf.makedf import make_hdrdf
 
-# beam is data's per-spill POT; MC and EXT write it empty, so one config serves every stream.
+# beam is data's per-spill POT and quality, trigger_spill each data event's triggering spill;
+# MC and EXT write them empty, so one config serves every stream.
 DFS = [make_true_type_df, make_true_kaon_df, make_slice_df,
-       make_track_df, make_pair_df, make_beam_df, make_hdrdf, make_file_df]
-NAMES = ["true_type", "true_kaon", "slice", "track", "pair", "beam", "hdr", "file"]
+       make_track_df, make_pair_df, make_beam_df, make_trigger_spill_df, make_hdrdf, make_file_df]
+NAMES = ["true_type", "true_kaon", "slice", "track", "pair", "beam", "trigger_spill", "hdr",
+         "file"]
 
 # kaon_format 5 products are blosc:zstd (run_df_maker reads these two names).
 COMPLIB, COMPLEVEL = "blosc:zstd", 4

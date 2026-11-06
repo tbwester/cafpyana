@@ -1199,20 +1199,68 @@ def _empty_index(*names) -> pd.MultiIndex:
     return pd.MultiIndex.from_arrays([np.array([], dtype=np.int64)] * len(names), names=names)
 
 
-def make_beam_df(f) -> pd.DataFrame:
-    """One row per BNB spill: the toroid POT, TOR860 and TOR875, from ``make_potdf_bnb``.
+#: Per-spill beam-quality fields kept beside the toroids in ``beam``: enough to apply a spill
+#: quality cut to the POT and to tie each spill to the event it was recorded with.
+BEAM_QUALITY = {"event": np.uint32, "spill_time_sec": np.uint32, "spill_time_nsec": np.uint32,
+                "THCURR": np.float32, "FOM": np.float32}
 
-    Data only; MC and EXT carry no spills and give an empty table. Indexed ``(entry, spill)``,
-    so ``hdr`` gives each spill its run and subrun. ``hdr.pot`` is the subrun's TOR875 sum and
+#: The triggering spill's record (``rec.hdr.spillbnbinfo``), one per data event. The device
+#: offsets are constants and the multiwire profiles are arrays, so neither is kept.
+TRIGGER_SPILL = {
+    "event": np.uint32, "spill_time_sec": np.uint32, "spill_time_nsec": np.uint32,
+    "TOR860": np.float32, "TOR875": np.float32, "THCURR": np.float32, "FOM": np.float32,
+    "BTJT2": np.float32, "LM875A": np.float32, "LM875B": np.float32, "LM875C": np.float32,
+    "HP873": np.float32, "VP873": np.float32, "HP875": np.float32, "VP875": np.float32,
+    "HPTG1": np.float32, "VPTG1": np.float32, "HPTG2": np.float32, "VPTG2": np.float32,
+}
+
+
+def _flat_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    frame.columns = [c if isinstance(c, str) else next(n for n in c if n) for c in frame.columns]
+    return frame
+
+
+def _empty_frame(dtypes: dict, *levels) -> pd.DataFrame:
+    return pd.DataFrame({name: pd.Series(dtype=dt) for name, dt in dtypes.items()},
+                        index=_empty_index(*levels))
+
+
+def make_beam_df(f) -> pd.DataFrame:
+    """One row per BNB spill: the toroid POT, TOR860 and TOR875, from ``make_potdf_bnb``, and the
+    spill's quality fields (`BEAM_QUALITY`): the event it was recorded with (``event``, equal to
+    that event's ``hdr.evt``), its time, the horn current and the beam figure of merit.
+
+    Data only; MC and EXT carry no spills and give an empty table. Indexed ``(entry, spill)``.
+    The CAF puts a subrun's spills on its first event, so ``entry`` is that event and ``event``
+    is the trigger each spill belongs to. ``hdr.pot`` is the subrun's TOR875 sum and
     ``hdr.nbnbinfo`` / ``hdr.noffbeambnb`` are the spill counts (kaonana unblinding B4).
     """
     beam = make_potdf_bnb(f)
     if beam.empty:
-        return pd.DataFrame(
-            {"TOR860": pd.Series(dtype="float64"), "TOR875": pd.Series(dtype="float64")},
-            index=_empty_index("entry", "spill"))
-    beam.columns = [c if isinstance(c, str) else next(n for n in c if n) for c in beam.columns]
-    return beam.rename_axis(["entry", "spill"])
+        return _empty_frame({"TOR860": "float64", "TOR875": "float64", **BEAM_QUALITY},
+                            "entry", "spill")
+    beam = _flat_columns(beam).rename_axis(["entry", "spill"])
+    quality = _flat_columns(ph.loadbranches(
+        f["recTree"], [f"rec.hdr.bnbinfo.{name}" for name in BEAM_QUALITY]).rec.hdr.bnbinfo)
+    quality = quality.rename_axis(["entry", "spill"]).astype(BEAM_QUALITY)
+    return beam.join(quality)
+
+
+def make_trigger_spill_df(f) -> pd.DataFrame:
+    """The triggering BNB spill of each data event (`TRIGGER_SPILL`), indexed ``entry`` like
+    ``hdr``: its toroids, horn current, figure of merit, beam positions, loss monitors and time.
+
+    Data only: simulation fills ``rec.hdr.spillbnbinfo`` with NaN and max-int sentinels, so MC gives
+    an empty table. This is what an event-level beam-quality cut reads; ``beam`` carries the
+    POT side.
+    """
+    tree = f["recTree"]
+    ismc = tree["rec.hdr.ismc"].array(library="np")
+    if len(ismc) == 0 or ismc.any():
+        return _empty_frame(TRIGGER_SPILL, "entry")
+    spill = _flat_columns(ph.loadbranches(
+        tree, [f"rec.hdr.spillbnbinfo.{name}" for name in TRIGGER_SPILL]).rec.hdr.spillbnbinfo)
+    return spill.rename_axis("entry").astype(TRIGGER_SPILL)
 
 def _extract_base_track_df(f: dict):
     """
