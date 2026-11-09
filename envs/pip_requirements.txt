@@ -17,3 +17,4 @@ corner
 lz4
 xxhash
 fsspec-xrootd
+numba==0.60.0

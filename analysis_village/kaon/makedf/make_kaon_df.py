@@ -10,7 +10,7 @@ import pandas as pd
 from makedf import chi2pid
 from makedf.makedf import make_mchdrdf, make_potdf_bnb, make_trkhitdf
 
-from . import range_momentum
+from . import beam_fom, range_momentum
 from .provenance import UNKNOWN_FILE_KEY, file_key
 from .stamp import stamp_columns
 
@@ -1228,7 +1228,9 @@ def _empty_frame(dtypes: dict, *levels) -> pd.DataFrame:
 def make_beam_df(f) -> pd.DataFrame:
     """One row per BNB spill: the toroid POT, TOR860 and TOR875, from ``make_potdf_bnb``, and the
     spill's quality fields (`BEAM_QUALITY`): the event it was recorded with (``event``, equal to
-    that event's ``hdr.evt``), its time, the horn current and the beam figure of merit.
+    that event's ``hdr.evt``), its time, the horn current and the beam figure of merit. Also the
+    SBN-doc-49735 beam-quality result (`beam_fom.FIELDS`): ``FOM_best`` (NaN without a FOM; cut
+    0.98 < FOM_best <= 1), ``fom_source``, ``fom_status`` and ``tor_used`` (sum it for POT).
 
     Data only; MC and EXT carry no spills and give an empty table. Indexed ``(entry, spill)``.
     The CAF puts a subrun's spills on its first event, so ``entry`` is that event and ``event``
@@ -1237,18 +1239,19 @@ def make_beam_df(f) -> pd.DataFrame:
     """
     beam = make_potdf_bnb(f)
     if beam.empty:
-        return _empty_frame({"TOR860": "float64", "TOR875": "float64", **BEAM_QUALITY},
-                            "entry", "spill")
+        return _empty_frame({"TOR860": "float64", "TOR875": "float64", **BEAM_QUALITY,
+                             **beam_fom.FIELDS}, "entry", "spill")
     beam = _flat_columns(beam).rename_axis(["entry", "spill"])
     quality = _flat_columns(ph.loadbranches(
         f["recTree"], [f"rec.hdr.bnbinfo.{name}" for name in BEAM_QUALITY]).rec.hdr.bnbinfo)
     quality = quality.rename_axis(["entry", "spill"]).astype(BEAM_QUALITY)
-    return beam.join(quality)
+    return beam_fom.attach(beam.join(quality), beam_fom.spill_quality(f)[0])
 
 
 def make_trigger_spill_df(f) -> pd.DataFrame:
     """The triggering BNB spill of each data event (`TRIGGER_SPILL`), indexed ``entry`` like
-    ``hdr``: its toroids, horn current, figure of merit, beam positions, loss monitors and time.
+    ``hdr``: its toroids, horn current, figure of merit, beam positions, loss monitors and time,
+    and the same spill's beam-quality result in ``beam`` (`beam_fom.FIELDS`).
 
     Data only: simulation fills ``rec.hdr.spillbnbinfo`` with NaN and max-int sentinels, so MC gives
     an empty table. This is what an event-level beam-quality cut reads; ``beam`` carries the
@@ -1257,10 +1260,11 @@ def make_trigger_spill_df(f) -> pd.DataFrame:
     tree = f["recTree"]
     ismc = tree["rec.hdr.ismc"].array(library="np")
     if len(ismc) == 0 or ismc.any():
-        return _empty_frame(TRIGGER_SPILL, "entry")
+        return _empty_frame({**TRIGGER_SPILL, **beam_fom.FIELDS}, "entry")
     spill = _flat_columns(ph.loadbranches(
         tree, [f"rec.hdr.spillbnbinfo.{name}" for name in TRIGGER_SPILL]).rec.hdr.spillbnbinfo)
-    return spill.rename_axis("entry").astype(TRIGGER_SPILL)
+    spill = spill.rename_axis("entry").astype(TRIGGER_SPILL)
+    return beam_fom.attach(spill, beam_fom.spill_quality(f)[1])
 
 def _extract_base_track_df(f: dict):
     """
