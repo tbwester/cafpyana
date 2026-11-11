@@ -1204,6 +1204,9 @@ def _empty_index(*names) -> pd.MultiIndex:
 BEAM_QUALITY = {"event": np.uint32, "spill_time_sec": np.uint32, "spill_time_nsec": np.uint32,
                 "THCURR": np.float32, "FOM": np.float32}
 
+#: ``rec.hdr.spillbnbinfo.event`` of a record with no triggering BNB spill (MC, EXT).
+NO_SPILL = np.uint32(4294967295)
+
 #: The triggering spill's record (``rec.hdr.spillbnbinfo``), one per data event. The device
 #: offsets are constants and the multiwire profiles are arrays, so neither is kept.
 TRIGGER_SPILL = {
@@ -1253,14 +1256,19 @@ def make_trigger_spill_df(f) -> pd.DataFrame:
     ``hdr``: its toroids, horn current, figure of merit, beam positions, loss monitors and time,
     and the same spill's beam-quality result in ``beam`` (`beam_fom.FIELDS`).
 
-    Data only: simulation fills ``rec.hdr.spillbnbinfo`` with NaN and max-int sentinels, so MC gives
-    an empty table. This is what an event-level beam-quality cut reads; ``beam`` carries the
-    POT side.
+    Beam-on data only: simulation and EXT fill ``rec.hdr.spillbnbinfo`` with NaN and max-int
+    sentinels, so both give an empty table. EXT is told apart by no record of the file having a
+    triggering spill: beam-on files lack one for a few events (36 of 89,946 on kdev) but never for
+    all. A table of sentinel rows would read as spills failing the beam cut downstream, so it is
+    not written. This is what an event-level beam-quality cut reads; ``beam`` carries the POT side.
     """
     tree = f["recTree"]
     ismc = tree["rec.hdr.ismc"].array(library="np")
+    empty = _empty_frame({**TRIGGER_SPILL, **beam_fom.FIELDS}, "entry")
     if len(ismc) == 0 or ismc.any():
-        return _empty_frame({**TRIGGER_SPILL, **beam_fom.FIELDS}, "entry")
+        return empty
+    if (tree["rec.hdr.spillbnbinfo.event"].array(library="np") == NO_SPILL).all():
+        return empty
     spill = _flat_columns(ph.loadbranches(
         tree, [f"rec.hdr.spillbnbinfo.{name}" for name in TRIGGER_SPILL]).rec.hdr.spillbnbinfo)
     spill = spill.rename_axis("entry").astype(TRIGGER_SPILL)
