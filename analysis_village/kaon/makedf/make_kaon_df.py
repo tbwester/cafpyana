@@ -1760,6 +1760,152 @@ def make_calo_stochastic_df(f: dict) -> pd.DataFrame:
     return make_calo_df(f, "stochastic")
 
 
+# --- control-sample hit tier --------------------------------------------------
+# The calorimetry Noise Model is fitted to hits, and `make_calo_df` collapses each track to twelve
+# numbers. This tier keeps every hit of the control-sample tracks: geomcalo's `2trk` and `3trk`
+# topologies (`geomcalo.control.ControlCuts` through `make_hit_frames.topology_cuts`), on all three
+# planes, as `make_trkhitdf` returns them. Nothing is calibrated, so a gain or Noise Model change
+# never needs a respin. Data is written unblinded: kaonana's signal box needs the BDT, so the box
+# is applied where the tier is read, not here.
+
+#: The control selection, held here because the grid pass cannot import geomcalo. Must match
+#: `geomcalo.control.ControlCuts` at the 140 cm muon cut; `nu_score` is geomcalo's `NU_SCORE`,
+#: `bcfm_score` and `track_score` kaonana's `cuts.bcfm_score` and `cuts.parent_track_score`.
+CONTROL_CUTS = {
+    "nu_score": 0.5,
+    "bcfm_score": 0.02,
+    "track_score": 0.5,
+    "vertex_cm": 5.0,
+    "muon_min_len_cm": 140.0,
+    "proton_len_cm": (10.0, 50.0),
+}
+
+#: Primaries per slice -> primaries allowed to pass neither leg cut (`2trk`, `3trk`).
+CONTROL_TOPOLOGIES = {2: 0, 3: 1}
+
+#: `control_track.leg` codes, geomcalo's leg names in order.
+CONTROL_LEGS = ("mu", "p", "x")
+
+#: The hit columns written, as `make_trkhitdf` names them and in its dtypes. Its `dedx` (the
+#: CAF's, superseded by any chain), `cryo` and `run` (in `hdr`) are left out. `rho` is cafpyana's
+#: float64 density constant, kept float64 so a dE/dx recomputed from these hits is bit-identical.
+CONTROL_HIT_COLUMNS = {
+    "dqdx": "float32", "integral": "float32", "sumadc": "float32", "width": "float32",
+    "mult": "int16", "rr": "float32", "pitch": "float32", "phi": "float32",
+    "efield": "float32", "rho": "float64", "x": "float32", "y": "float32", "z": "float32",
+    "t": "float32", "wire": "int16", "tpc": "int16", "plane": "int8",
+    "firsthit": "bool", "lasthit": "bool",
+}
+
+CONTROL_TRACK_COLUMNS = {
+    "leg": "int8", "rank": "int8", "n_primary": "int8", "is_contained": "bool",
+    "trk_len": "float32",
+}
+
+CONTROL_TRACK_LEVELS = ("entry", "rec.slc..index", "pfp_index")
+CONTROL_HIT_LEVELS = (*CONTROL_TRACK_LEVELS, "hit")
+
+_CONTROL_CACHE = {"recTree": None, "tracks": None}
+
+
+def select_control_tracks(slices: pd.DataFrame, tracks: pd.DataFrame,
+                          cuts: dict = CONTROL_CUTS) -> pd.DataFrame:
+    """The control tracks of one file's `slices` and (preselected) `tracks` frames.
+
+    One row per track of a passing slice, all its vertex primaries included, with
+    `CONTROL_TRACK_COLUMNS`. A port of `geomcalo.control.select_legs`, row for row.
+    """
+    levels = list(SLICE_LEVELS)
+    passing = slices.index[((slices["nu_score"] > cuts["nu_score"])
+                            & (slices["barycenterFM_score"] > cuts["bcfm_score"])).fillna(False)]
+    subset = tracks[tracks.index.droplevel(-1).isin(passing)]
+    subset = subset[(subset["trackScore"] > cuts["track_score"]).fillna(False)]
+    vertex = slices[["vertex_x", "vertex_y", "vertex_z"]].reindex(subset.index.droplevel(-1))
+    vertex.index = subset.index
+    dist = np.sqrt(sum((subset[f"start_{a}"] - vertex[f"vertex_{a}"]) ** 2 for a in "xyz"))
+    subset = subset[dist < cuts["vertex_cm"]]
+
+    n_primary = subset.groupby(level=levels)["trk_len"].transform("size")
+    subset = subset[n_primary.isin(list(CONTROL_TOPOLOGIES))]
+    if subset.empty:
+        return _empty_frame(CONTROL_TRACK_COLUMNS, *CONTROL_TRACK_LEVELS)
+    n_primary = n_primary[subset.index]
+
+    def ends(end):
+        return subset[[f"{end}_x", f"{end}_y", f"{end}_z"]].set_axis(["x", "y", "z"], axis=1)
+
+    contained = (InFV_SBND(ends("start")) & InFV_SBND(ends("end"))).fillna(False).to_numpy()
+    rank = subset.groupby(level=levels)["trk_len"].rank(method="first", ascending=False)
+    longest = rank.to_numpy() == 1.0
+    low, high = cuts["proton_len_cm"]
+    short = ~longest & contained & subset["trk_len"].between(low, high).to_numpy()
+    leg = np.select([longest, short], [0, 1], 2)
+
+    muon = longest & (subset["trk_len"] > cuts["muon_min_len_cm"]).to_numpy()
+    per_slice = pd.DataFrame({"muon": muon, "proton": short, "extra": leg == 2},
+                             index=subset.index).groupby(level=levels).sum()
+    allowed = pd.Series(CONTROL_TOPOLOGIES).reindex(
+        n_primary.groupby(level=levels).first().reindex(per_slice.index)).to_numpy()
+    ok = per_slice.index[(per_slice["muon"] == 1) & (per_slice["proton"] >= 1)
+                         & (per_slice["extra"] <= allowed)]
+    out = pd.DataFrame({"leg": leg, "rank": rank.to_numpy(), "n_primary": n_primary.to_numpy(),
+                        "is_contained": contained, "trk_len": subset["trk_len"].to_numpy()},
+                       index=subset.index)
+    out = out[out.index.droplevel(-1).isin(ok)].astype(CONTROL_TRACK_COLUMNS)
+    return out.rename_axis(list(CONTROL_TRACK_LEVELS))
+
+
+def _control_tracks(f) -> pd.DataFrame:
+    """`select_control_tracks` on this file, cached on the recTree as `_HIT_CACHE` is."""
+    tree = f["recTree"]
+    if _CONTROL_CACHE["recTree"] is not tree:
+        tracks, _ = _base_track_df(f)
+        _CONTROL_CACHE["recTree"] = tree
+        _CONTROL_CACHE["tracks"] = select_control_tracks(make_slice_df(f), tracks)
+    return _CONTROL_CACHE["tracks"]
+
+
+def make_control_track_df(f: dict) -> pd.DataFrame:
+    """The control-sample tracks, one row each: `leg` (`CONTROL_LEGS`), `rank` by length,
+    `n_primary` (2 or 3), `is_contained` and `trk_len`. Indexed `CONTROL_TRACK_LEVELS`."""
+    return _control_tracks(f)
+
+
+def make_control_hit_df(f: dict) -> pd.DataFrame:
+    """Every hit of every control-sample track, planes 0-2, `CONTROL_HIT_COLUMNS`, raw.
+
+    Indexed `CONTROL_HIT_LEVELS`; `hit` restarts per plane, so a hit is keyed with `plane`.
+    """
+    tracks = _control_tracks(f)
+    frames = []
+    if len(tracks):
+        for plane, hits in _hits_for(f).items():
+            if hits.empty:
+                continue
+            cell = hits[hits.index.droplevel(-1).isin(tracks.index)]
+            if cell.empty:
+                continue
+            cell = _flat_columns(cell.copy())
+            cell["plane"] = plane
+            frames.append(cell[list(CONTROL_HIT_COLUMNS)].astype(CONTROL_HIT_COLUMNS))
+    if not frames:
+        return _empty_frame(CONTROL_HIT_COLUMNS, *CONTROL_HIT_LEVELS)
+    return pd.concat(frames).rename_axis(list(CONTROL_HIT_LEVELS))
+
+
+def make_control_seed_df(f: dict) -> pd.DataFrame:
+    """`_calo_seed` per plane, indexed `plane`: the seed `make_calo_df` smears with.
+
+    It hashes the whole plane's hit table, which the tier does not hold, so a treatment applied
+    to the tier's hits reads its seed from here to reproduce the production draw.
+    """
+    hits = _hits_for(f)
+    seeds = [_calo_seed(hits[p]) for p in (0, 1, 2) if not hits[p].empty]
+    planes = [p for p in (0, 1, 2) if not hits[p].empty]
+    return pd.DataFrame({"calo_seed": np.array(seeds, dtype="int64")},
+                        index=pd.Index(np.array(planes, dtype="int64"), name="plane"))
+
+
 def make_pfp_geom_df(f: dict) -> pd.DataFrame:
     """One row per pfp: the track direction at both ends, and its place in the hierarchy.
 
