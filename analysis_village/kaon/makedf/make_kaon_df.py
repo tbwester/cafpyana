@@ -945,6 +945,12 @@ def make_slice_df(f: dict) -> pd.DataFrame:
         'rec.slc.nu_score',
         'rec.slc.is_clear_cosmic',
         'rec.slc.barycenterFM.score',
+        # The matched flash's total PE and time, and the slice's total charge: what a light
+        # cut (e.g. PE > 1500) and in-time cosmic studies read. -9999 without a match, as
+        # the score is. Exported rather than applied: 3 floats on the smallest table.
+        'rec.slc.barycenterFM.flashPEs',
+        'rec.slc.barycenterFM.flashTime',
+        'rec.slc.barycenterFM.chargeTotal',
         'rec.slc.tmatch.index',
         # The reconstructed slice vertex. The v2 writer applied
         # InFV_SBND(slc.vertex) as a production pre-cut, so kaonana's
