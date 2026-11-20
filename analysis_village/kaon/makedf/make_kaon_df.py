@@ -247,11 +247,16 @@ G4_PRIMARY_PARENT = 10000000
 KORIGIN_UNKNOWN = -1  # parent record missing from the particle list
 KORIGIN_PRIMARY = 0   # produced at the neutrino vertex
 KORIGIN_PI = 1        # pi+/- -> K
-KORIGIN_K0 = 2        # K0 / K0L / K0S -> K, i.e. charge exchange
+KORIGIN_K0 = 2        # K0 / K0L / K0S from the vertex -> K, i.e. charge exchange
 KORIGIN_P = 3         # proton -> K
 KORIGIN_OTHER = 4     # anything else: neutron, muon, hyperons, ...
 
 _K0_PDGS = (311, -311, 130, 310)
+# Kaons an origin is walked back through: a charged kaon that reinteracts and a
+# neutral one that charge-exchanges into it. A pi -> K0 -> K+ chain is therefore
+# KORIGIN_PI: the generator-level kaon filter keeps vertex kaons only, and
+# true_type 6 is pooled with the filtered sample on that premise.
+_K_PDGS_WALKED = K_PDGS_TRACKED + _K0_PDGS
 KORIGIN_COUNT_COLS = {
     KORIGIN_PRIMARY: "n_k_primary",
     KORIGIN_PI: "n_k_from_pi",
@@ -334,12 +339,17 @@ def resolve_k_origins(tpartdf, max_depth=32):
     """Classify every charged kaon in the event by what ultimately produced it.
 
     Walks back through K -> K reinteraction chains, so a primary kaon that
-    scatters is still classed as primary rather than as "produced by a kaon".
+    scatters is still classed as primary rather than as "produced by a kaon",
+    and through neutral kaons, so KORIGIN_K0 means a K0 from the vertex. A K0
+    whose own parent is missing from the particle list keeps KORIGIN_K0: only
+    a non-kaon producer found on the walk reclassifies it.
 
     Returns one row per kaon, keyed by (entry, G4ID):
         origin            KORIGIN_* class
-        origin_pdg        pdg of the ultimate non-kaon ancestor, 0 if primary
-        n_reinteractions  kaon -> kaon steps back to that ancestor
+        origin_pdg        pdg of the ultimate non-kaon ancestor, 0 if primary;
+                          for KORIGIN_K0, the earliest kaon on the walk
+        n_reinteractions  charged-kaon -> kaon steps before the first neutral
+                          kaon; 0 marks a production (charge exchange included)
 
     Named n_reinteractions, not n_k_interactions, so that a per-kaon row can be
     joined against true_type_df without a column collision -- true_type_df
@@ -357,21 +367,32 @@ def resolve_k_origins(tpartdf, max_depth=32):
     lookup = df[['entry', 'G4ID', 'pdg', 'parent']].rename(
         columns={'G4ID': 'pG4', 'pdg': 'ppdg', 'parent': 'pparent'})
 
-    cur = kaons[['entry', 'G4ID', 'parent']].copy()
+    cur = kaons[['entry', 'G4ID', 'parent', 'pdg']].copy()
     cur['k_G4ID'] = cur['G4ID']  # the kaon this row is resolving, fixed as we walk
+    cur['via_k0'] = False        # a neutral kaon has been crossed
+    cur['nre'] = 0
     found, depth = [], 0
 
     def _record(rows, origin, origin_pdg):
-        r = rows[['entry', 'k_G4ID']].copy()
+        r = rows[['entry', 'k_G4ID', 'nre']].rename(
+            columns={'nre': 'n_reinteractions'})
         r['origin'] = origin
         r['origin_pdg'] = origin_pdg
-        r['n_reinteractions'] = depth
         found.append(r)
+
+    def _record_split(rows, origin):
+        """*origin* for rows still on charged kaons, KORIGIN_K0 past a K0."""
+        k0 = rows.via_k0.to_numpy(dtype=bool)
+        if (~k0).any():
+            _record(rows[~k0], origin, 0)
+        if k0.any():
+            _record(rows[k0], KORIGIN_K0,
+                    rows.pdg.to_numpy()[k0].astype(np.int64))
 
     while not cur.empty and depth < max_depth:
         at_vertex = cur.parent == G4_PRIMARY_PARENT
         if at_vertex.any():
-            _record(cur[at_vertex], KORIGIN_PRIMARY, 0)
+            _record_split(cur[at_vertex], KORIGIN_PRIMARY)
         cur = cur[~at_vertex]
         if cur.empty:
             break
@@ -380,17 +401,27 @@ def resolve_k_origins(tpartdf, max_depth=32):
                       right_on=['entry', 'pG4'], how='left')
         lost = m.ppdg.isna()
         if lost.any():
-            _record(m[lost], KORIGIN_UNKNOWN, 0)
+            _record_split(m[lost], KORIGIN_UNKNOWN)
         m = m[~lost]
 
-        is_k = m.ppdg.isin(K_PDGS_TRACKED)
-        stop = m[~is_k]
+        walk = m.ppdg.isin(_K_PDGS_WALKED)
+        stop = m[~walk]
         if not stop.empty:
             _record(stop, _classify_producer(stop.ppdg.to_numpy()),
                     stop.ppdg.to_numpy().astype(np.int64))
 
-        cur = m[is_k][['entry', 'k_G4ID', 'pG4', 'pparent']].rename(
-            columns={'pG4': 'G4ID', 'pparent': 'parent'})
+        m = m[walk]
+        charged = m.ppdg.isin(K_PDGS_TRACKED).to_numpy()
+        via_k0 = m.via_k0.to_numpy(dtype=bool)
+        cur = pd.DataFrame({
+            'entry': m.entry.to_numpy(),
+            'G4ID': m.pG4.to_numpy(),
+            'parent': m.pparent.to_numpy(),
+            'pdg': m.ppdg.to_numpy().astype(np.int64),
+            'k_G4ID': m.k_G4ID.to_numpy(),
+            'via_k0': via_k0 | ~charged,
+            'nre': m.nre.to_numpy() + (charged & ~via_k0),
+        })
         depth += 1
 
     if not found:
@@ -783,7 +814,7 @@ def make_true_type_df(f) -> pd.DataFrame:
     #     3  other contained K+
     #     4  uncontained K+
     #     5  secondary K from a pion       )
-    #     6  secondary K from a K0         )  no K+ at the vertex, but one was
+    #     6  secondary K from a vertex K0  )  no K+ at the vertex, but one was
     #     7  secondary K from a proton     )  produced later in the shower
     #     8  secondary K from anything else)
     #    98  no K+ in FV
