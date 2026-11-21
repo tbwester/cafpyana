@@ -240,6 +240,11 @@ def dqdx(dqdxdf, gain=None, calibrate=None, isMC=False, charge="integral"):
         # which is what trigger_offset() returns in CalorimetryAlg::LifetimeCorrection
         tdrift = dqdxdf.t / 2000. - 0.205
         etau_corr = np.exp(tdrift / etau)
+        if charge == "dqdx" and not isMC:
+            # Data's CAF dqdx is already lifetime-corrected by GnocchiCalorimetry's
+            # NormalizeDriftSQLite (calorimetry_sbnd.fcl, sbnd_calonormtoolsdata); MC's
+            # NormTools carry only the YZ map, so MC still takes the correction here.
+            etau_corr = pd.Series(1., index=dqdxdf.index)
         #dqdxdf['etau_corr'] = etau_corr ## FIXME
         dqdx = dqdx * etau_corr * yz_scale
 
