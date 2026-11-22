@@ -754,6 +754,13 @@ def make_true_type_df(f) -> pd.DataFrame:
     res['is_true_fv'] = is_true_fv.fillna(False).astype(bool)
     res['true_E_nu'] = true_E_nu
 
+    # The true vertex itself, not only the FV decision made from it: a secondary
+    # kaon's displacement from the interaction, and how far outside the FV a
+    # true_type 99 vertex sat, both need the position. float32 is the CAF's own
+    # storage class.
+    for _c in 'xyz':
+        res[f'true_vtx_{_c}'] = mcdf['position'][_c].astype('float32')
+
     # GENIE interaction mode, as the raw genie::EScatteringType integer
     # (0 QE, 1 RES, 2 DIS, 3 COH, 10 MEC, ...). Deliberately not mapped to
     # labels here: the mapping is a presentation choice, and a value this
@@ -850,7 +857,8 @@ def make_true_type_df(f) -> pd.DataFrame:
     # reconstruct the true_type decision downstream.
     keep_cols = (['true_type', 'is_cc', 'genie_mode', 'is_true_fv', 'is_k_contained',
                   'true_E_nu', 'true_E_kaon', 'true_P_kaon', 'n_k_interactions',
-                  'true_W', 'true_Q2', 'genie_inttype', 'target_pdg']
+                  'true_W', 'true_Q2', 'genie_inttype', 'target_pdg',
+                  'true_vtx_x', 'true_vtx_y', 'true_vtx_z']
                  + list(KORIGIN_COUNT_COLS.values())
                  + list(PRIM_SPECIES))
     # Small enumerations and counters: true_type is 1-99, the rest are far below 32767.
